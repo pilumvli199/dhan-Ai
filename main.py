@@ -50,86 +50,73 @@ STOCKS_WATCHLIST = [
     "TATAMOTORS", "AXISBANK", "SBIN", "ADANIENT", "KOTAKBANK",
     "LT", "MARUTI", "NTPC", "BHARTIARTL", "POWERGRID", "M&M", "WIPRO"
 ]
-# Note: Indices like NIFTY/SENSEX use a different security ID logic and are excluded for stability.
 
 # --- GEMINI AI ANALYZER ---
-class GeminiAnalyzer:
+class GeminiPriceActionAnalyzer:
     def __init__(self):
         self.model = genai.GenerativeModel('gemini-1.5-flash') if GEMINI_API_KEY else None
 
-    def calculate_technical_indicators(self, candles_df):
-        try:
-            df = candles_df.copy()
-            # RSI
-            delta = df['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
-            loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
-            df['RSI'] = 100 - (100 / (1 + (gain / loss)))
-            # MACD
-            exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-            exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-            df['MACD'] = exp1 - exp2
-            df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-            
-            latest = df.iloc[-1]
-            return {'rsi': latest['RSI'], 'macd': latest['MACD'], 'macd_signal': latest['MACD_Signal']}
-        except Exception:
-            return {}
-
-    def format_data_for_ai(self, symbol, oc_data, candles_df, indicators):
+    def format_data_for_ai(self, symbol, oc_data, candles_df):
         spot_price = oc_data.get('spotPrice', 0)
-        atm_strike = min([d['strikePrice'] for d in oc_data['optionChainDetails']], key=lambda x: abs(x - spot_price))
         
-        # Format Option Chain
+        # Format Option Chain for key levels
         oc_text = "STRIKE | CE OI (Lakhs) | PE OI (Lakhs)\n"
-        for detail in sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice']):
-            if abs(detail['strikePrice'] - atm_strike) <= (atm_strike * 0.05):
-                oc_text += f"{detail['strikePrice']:<6.0f} | {detail.get('ce_openInterest', 0) / 100000:<15.2f} | {detail.get('pe_openInterest', 0) / 100000:<15.2f}\n"
+        all_strikes = sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice'])
+        max_ce_oi = max(all_strikes, key=lambda x: x.get('ce_openInterest', 0))
+        max_pe_oi = max(all_strikes, key=lambda x: x.get('pe_openInterest', 0))
 
+        oc_text += f"Max CE OI at: {max_ce_oi['strikePrice']} ({max_ce_oi.get('ce_openInterest',0)/100000:.2f}L)\n"
+        oc_text += f"Max PE OI at: {max_pe_oi['strikePrice']} ({max_pe_oi.get('pe_openInterest',0)/100000:.2f}L)\n"
+        
         # Format Candle Data
         candle_text = "Time | Open | High | Low | Close | Volume\n"
-        for _, row in candles_df.tail(20).iterrows():
+        for _, row in candles_df.tail(30).iterrows(): # Last 30 candles for context
             candle_text += f"{row.name.strftime('%H:%M')} | {row.Open:.2f} | {row.High:.2f} | {row.Low:.2f} | {row.Close:.2f} | {row.Volume:,}\n"
 
         # Build Final Prompt
-        return f"""You are an expert F&O technical analyst. Analyze all data for {symbol} and create a detailed trade setup in Marathi.
+        return f"""You are an expert Price Action trader. Your goal is to analyze the provided chart image, option chain data, and raw candle data to find a high-probability trade. Do not use complex indicators like RSI or MACD. Focus only on what you see.
 
-## 1. Summary
-- **Symbol:** {symbol} | **Spot Price:** ₹{spot_price:,.2f} | **ATM:** ₹{atm_strike:,.0f}
-- **RSI(14):** {indicators.get('rsi', 0):.2f} | **MACD:** {indicators.get('macd', 0):.2f}
-
-## 2. Option Chain (OI in Lakhs)
+## Market Data for {symbol}
+- **Spot Price:** ₹{spot_price:,.2f}
+- **Option Chain Key Levels:**
 {oc_text}
-
-## 3. Price Action
+- **Recent Price Action (Raw Data):**
 {candle_text}
 
 ---
-## Analysis & Trade Alert (Marathi मध्ये):
-1.  **Technical Analysis:** Chart image आणि price action नुसार, trend काय आहे (Uptrend/Downtrend/Sideways)? Key support/resistance levels ओळखा. कोणता chart pattern (e.g., breakout, flag) दिसतोय का?
-2.  **Option Chain Analysis:** Option chain नुसार, सर्वाधिक Call OI (resistance) आणि Put OI (support) कुठे आहे? एकूण sentiment (Bullish/Bearish) काय आहे?
-3.  **🚨 Final Verdict & Trade Alert:**
-    - **Trade Setup:** (Yes/No)?
-    - **Action:** (BUY CE / BUY PE)?
-    - **Strike:** ₹[STRIKE]
-    - **Entry:** ₹[ENTRY]
-    - **Target:** ₹[TARGET]
-    - **Stop Loss:** ₹[SL]
-    - **Reasoning:** (2-3 ओळीत ट्रेड का घ्यावा).
-    - **No Trade:** जर trade नसेल, तर "No clear setup, wait and watch" असे लिहा.
+## Analysis & Trade Alert (in simple Marathi):
+
+**1. Price Action & Chart Pattern Analysis:**
+   - Chart image आणि raw data बघून सध्याचा ट्रेंड काय आहे (Uptrend/Downtrend/Sideways)?
+   - महत्त्वाचे Support आणि Resistance levels कोणते आहेत?
+   - कोणता Chart Pattern दिसत आहे का? (उदा. Breakout, Triangle, Channel, Double Top/Bottom)
+   - महत्त्वाचे Candlestick Patterns (उदा. Engulfing, Doji, Hammer) कोणते दिसत आहेत?
+
+**2. Option Chain Sentiment:**
+   - Option Chain नुसार, सर्वात मोठा Support (Max PE OI) आणि Resistance (Max CE OI) कुठे आहे?
+   - यावरून बाजाराचा कल (sentiment) काय वाटतो (Bullish/Bearish)?
+
+**3. 🚨 Final Verdict & Trade Alert:**
+   - **Trade Setup आहे का?** (Yes/No)
+   - **Action:** (BUY CE / BUY PE)?
+   - **Strike:** ₹[STRIKE]
+   - **Entry Price (Option Premium):** ₹[ENTRY]
+   - **Target:** ₹[TARGET]
+   - **Stop Loss:** ₹[SL]
+   - **Reason (थोडक्यात):** (हा ट्रेड का घ्यावा याची २-३ कारणे).
+   - **No Trade:** जर स्पष्ट trade नसेल, तर "सध्या कोणताही स्पष्ट ट्रेड नाही. Breakout/Breakdown ची वाट पहा." असे लिहा.
 """
 
     async def analyze(self, symbol, chart_buf, oc_data, candles_df):
         if not self.model: return "AI analysis is disabled."
         try:
-            logger.info(f"🤖 Running Gemini Flash analysis for {symbol}...")
-            indicators = self.calculate_technical_indicators(candles_df)
-            prompt = self.format_data_for_ai(symbol, oc_data, candles_df, indicators)
+            logger.info(f"🤖 Running Price Action analysis for {symbol}...")
+            prompt = self.format_data_for_ai(symbol, oc_data, candles_df)
             
             chart_buf.seek(0)
             image_part = {"mime_type": "image/png", "data": chart_buf.read()}
             
-            response = await self.model.generate_content_async([prompt, image_part], generation_config={"temperature": 0.3})
+            response = await self.model.generate_content_async([prompt, image_part], generation_config={"temperature": 0.2})
             return response.text
         except Exception as e:
             logger.error(f"Error during Gemini analysis for {symbol}: {e}")
@@ -141,8 +128,8 @@ class DhanTradingBot:
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.headers = {'access-token': DHAN_ACCESS_TOKEN}
         self.security_id_map = {}
-        self.gemini_analyzer = GeminiAnalyzer()
-        logger.info("🚀 AI Trading Bot Initialized")
+        self.gemini_analyzer = GeminiPriceActionAnalyzer()
+        logger.info("🚀 Price Action AI Bot Initialized")
 
     async def load_security_ids(self):
         try:
@@ -181,7 +168,7 @@ class DhanTradingBot:
         try:
             if method == 'POST':
                 response = requests.post(url, json=payload, headers=self.headers, timeout=15)
-            else: # GET
+            else:
                 response = requests.get(url, params=payload, headers=self.headers, timeout=15)
             response.raise_for_status()
             data = response.json()
@@ -195,22 +182,18 @@ class DhanTradingBot:
             df_chart = df.copy(); df_chart.set_index('Date', inplace=True)
             df_chart['SMA20'] = df_chart['Close'].rolling(window=20).mean()
             df_chart['SMA50'] = df_chart['Close'].rolling(window=50).mean()
-            sma20 = df_chart['SMA20']; std20 = df_chart['Close'].rolling(window=20).std()
-            df_chart['BB_Upper'] = sma20 + (std20 * 2)
-            df_chart['BB_Lower'] = sma20 - (std20 * 2)
 
-            mc = mpf.make_marketcolors(up='#00ff88', down='#ff4444', inherit=True)
-            s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds', rc={'font.size': 10})
+            mc = mpf.make_marketcolors(up='#10FF70', down='#FF3333', inherit=True, wick='inherit', edge='inherit')
+            s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds', rc={'font.size': 12, 'axes.labelcolor': 'white', 'xtick.color': 'white', 'ytick.color': 'white'})
             apds = [
-                mpf.make_addplot(df_chart['SMA20'], color='#ffa500', width=1.2),
-                mpf.make_addplot(df_chart['SMA50'], color='#00bfff', width=1.2),
-                mpf.make_addplot(df_chart['BB_Upper'], color='#9370db', width=0.8, linestyle='--'),
-                mpf.make_addplot(df_chart['BB_Lower'], color='#9370db', width=0.8, linestyle='--'),
+                mpf.make_addplot(df_chart['SMA20'], color='#FFD700', width=1.2),
+                mpf.make_addplot(df_chart['SMA50'], color='#00BFFF', width=1.2),
             ]
-            fig, axes = mpf.plot(df_chart.tail(100), type='candle', style=s, volume=True, addplot=apds,
-                                 title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}', figsize=(15, 8), returnfig=True)
-            axes[0].legend(['SMA20', 'SMA50', 'BB Upper', 'BB Lower'])
-            buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=120); buf.seek(0)
+            fig, axes = mpf.plot(df_chart.tail(120), type='candle', style=s, volume=True, addplot=apds,
+                                 title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}', figsize=(16, 8), returnfig=True,
+                                 panel_ratios=(4, 1), volume_panel=1)
+            axes[0].legend(['SMA20', 'SMA50'])
+            buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=120, bbox_inches='tight'); buf.seek(0)
             return buf
         except Exception as e:
             logger.error(f"Error creating chart for {symbol}: {e}")
@@ -231,7 +214,7 @@ class DhanTradingBot:
             if not hist_data: return
 
             candles_df = pd.DataFrame({'Date': pd.to_datetime(hist_data['start_Time'], unit='s'), 'Open': hist_data['open'], 'High': hist_data['high'], 'Low': hist_data['low'], 'Close': hist_data['close'], 'Volume': hist_data['volume']})
-            if len(candles_df) < 50: return # Need enough data for indicators
+            if len(candles_df) < 50: return
             
             spot_price = oc_data.get('spotPrice', 0)
             chart_buf = self.create_chart(candles_df, symbol, spot_price)
@@ -239,7 +222,13 @@ class DhanTradingBot:
 
             ai_analysis_text = await self.gemini_analyzer.analyze(symbol, chart_buf, oc_data, candles_df)
 
-            caption = f"🤖 ***AI Analysis for {symbol}***\n\n{ai_analysis_text}"
+            # Check if AI generated a trade alert
+            if "BUY CE" in ai_analysis_text or "BUY PE" in ai_analysis_text:
+                alert_header = f"🚨 **TRADE ALERT: {symbol}** 🚨"
+            else:
+                alert_header = f"📉 *Analysis for {symbol}*"
+
+            caption = f"{alert_header}\n\n{ai_analysis_text}"
             chart_buf.seek(0)
             await self.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=InputFile(chart_buf, filename=f"{symbol}.png"), caption=caption, parse_mode='Markdown')
             logger.info(f"✅ Analysis sent for {symbol}")
@@ -272,13 +261,13 @@ async def main():
     bot = DhanTradingBot()
 
     if await bot.load_security_ids():
-        await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **AI Trading Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
+        await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **Price Action AI Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
         while True:
             logger.info("============== NEW SCAN CYCLE ==============")
             for symbol in bot.security_id_map.keys():
                 await bot.process_stock(symbol)
                 logger.info("--- Waiting 3 seconds before next stock ---")
-                await asyncio.sleep(3) # Rate limit
+                await asyncio.sleep(3)
             
             logger.info("Scan cycle complete. Waiting for 10 minutes...")
             await asyncio.sleep(600)
