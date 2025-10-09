@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py - Dhan Option Chain Bot with Gemini vision analysis (1 req/sec)
+# main.py - Dhan Option Chain Bot with Gemini vision analysis (robust loader + 1 req/sec limit)
 import asyncio
 import os
 from telegram import Bot
@@ -32,7 +32,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========================
-# CONFIGURATION
+# CONFIGURATION (env vars)
 # ========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -40,7 +40,7 @@ DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # preferred for free-tier API key use
 
-# Dhan API URLs (as in your original)
+# Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
 DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
 DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
@@ -49,11 +49,13 @@ DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 DHAN_HISTORICAL_URL = f"{DHAN_API_BASE}/v2/charts/historical"
 DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
 
-# Stock/Index list (same as you)
+# Stock/Index List - Symbol mapping
 STOCKS_INDICES = {
+    # Indices
     "NIFTY 50": {"symbol": "NIFTY 50", "segment": "IDX_I"},
     "NIFTY BANK": {"symbol": "NIFTY BANK", "segment": "IDX_I"},
     "SENSEX": {"symbol": "SENSEX", "segment": "IDX_I"},
+    # Stocks
     "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ"},
     "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ"},
     "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ"},
@@ -88,7 +90,7 @@ STOCKS_INDICES = {
 
 class DhanOptionChainBot:
     def __init__(self):
-        self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        self.bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
         self.running = True
         self.headers = {
             'access-token': DHAN_ACCESS_TOKEN,
@@ -120,61 +122,166 @@ class DhanOptionChainBot:
             logger.info("No GEMINI_API_KEY found - Gemini analysis disabled")
 
     # --------------------
-    # Security ID loader
+    # Debug preview for instruments CSV
+    # --------------------
+    async def debug_instruments_preview(self, max_rows=20):
+        """
+        Downloads the master CSV and logs header + first max_rows rows (useful for debugging).
+        """
+        try:
+            logger.info("Downloading Dhan instruments file for debug preview...")
+            resp = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
+            logger.info(f"Download status: {resp.status_code}; bytes={len(resp.content) if resp.content else 0}")
+            if resp.status_code != 200:
+                logger.warning("Could not download instruments CSV (non-200).")
+                return None
+
+            text = resp.content
+            decoded = None
+            for enc in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    decoded = text.decode(enc)
+                    logger.info(f"Decoded CSV with encoding: {enc}")
+                    break
+                except Exception:
+                    decoded = None
+            if not decoded:
+                logger.error("Failed to decode CSV with common encodings.")
+                return None
+
+            lines = decoded.splitlines()
+            if not lines:
+                logger.warning("CSV is empty after decoding.")
+                return None
+
+            header_line = lines[0]
+            logger.info(f"CSV Header Line: {header_line}")
+            logger.info("---- First rows preview ----")
+            for i, ln in enumerate(lines[1:1+max_rows], start=1):
+                logger.info(f"ROW {i}: {ln[:400]}")
+            logger.info("---- End preview ----")
+            return decoded
+
+        except Exception as e:
+            logger.error(f"Error in debug_instruments_preview: {e}")
+            return None
+
+    # --------------------
+    # Robust loader for security IDs
     # --------------------
     async def load_security_ids(self):
-        """Dhan मधून security IDs load करतो (without pandas)"""
+        """
+        Robust loader: tries multiple possible header names, strips BOM, case-insensitive matching,
+        and logs useful warnings when symbol not found.
+        """
         try:
-            logger.info("Loading security IDs from Dhan...")
-            response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
-
-            if response.status_code == 200:
-                csv_data = response.text.split('\n')
-                reader = csv.DictReader(csv_data)
-
-                for symbol, info in STOCKS_INDICES.items():
-                    segment = info['segment']
-                    symbol_name = info['symbol']
-
-                    for row in reader:
-                        try:
-                            if segment == "IDX_I":
-                                if (row.get('SEM_SEGMENT') == 'I' and
-                                    row.get('SEM_TRADING_SYMBOL') == symbol_name):
-                                    sec_id = row.get('SEM_SMST_SECURITY_ID')
-                                    if sec_id:
-                                        self.security_id_map[symbol] = {
-                                            'security_id': int(sec_id),
-                                            'segment': segment,
-                                            'trading_symbol': symbol_name
-                                        }
-                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
-                                        break
-                            else:
-                                if (row.get('SEM_SEGMENT') == 'E' and
-                                    row.get('SEM_TRADING_SYMBOL') == symbol_name and
-                                    row.get('SEM_EXM_EXCH_ID') == 'NSE'):
-                                    sec_id = row.get('SEM_SMST_SECURITY_ID')
-                                    if sec_id:
-                                        self.security_id_map[symbol] = {
-                                            'security_id': int(sec_id),
-                                            'segment': segment,
-                                            'trading_symbol': symbol_name
-                                        }
-                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
-                                        break
-                        except Exception:
-                            continue
-
-                    # Reset CSV reader for next symbol
-                    csv_data_reset = response.text.split('\n')
-                    reader = csv.DictReader(csv_data_reset)
-
-                logger.info(f"Total {len(self.security_id_map)} securities loaded")
-                return True
-            else:
-                logger.error(f"Failed to load instruments: {response.status_code}")
+            logger.info("Loading security IDs from Dhan (robust loader)...")
+            resp = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
+            if resp.status_code != 200:
+                logger.error(f"Failed to download instruments CSV: HTTP {resp.status_code}")
                 return False
+
+            content = resp.content
+            csv_text = None
+            for enc in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    csv_text = content.decode(enc)
+                    logger.info(f"Decoded instruments CSV using encoding: {enc}")
+                    break
+                except Exception:
+                    csv_text = None
+            if csv_text is None:
+                logger.error("Unable to decode instruments CSV with common encodings.")
+                return False
+
+            lines = csv_text.splitlines()
+            reader = csv.DictReader(lines)
+            headers = reader.fieldnames or []
+            headers_normalized = [h.strip().lower() for h in headers]
+            logger.info(f"Detected CSV headers ({len(headers)}): {headers}")
+
+            # Candidate column names (common variants)
+            possible_cols = {
+                'trading_symbol': ['sem_trading_symbol', 'trading_symbol', 'symbol', 'sc_name', 'tradingsymbol'],
+                'security_id': ['sem_smst_security_id', 'smst_security_id', 'security_id', 'smst_id', 'scripcode'],
+                'segment': ['sem_segment', 'segment', 'seg', 'seg_type'],
+                'exchange': ['sem_exm_exch_id', 'exchange', 'exm_exch_id', 'exch', 'ex'],
+            }
+
+            mapped_cols = {}
+            for key, variants in possible_cols.items():
+                mapped_cols[key] = None
+                for v in variants:
+                    if v.lower() in headers_normalized:
+                        idx = headers_normalized.index(v.lower())
+                        mapped_cols[key] = headers[idx]
+                        break
+
+            logger.info(f"Mapped columns: {mapped_cols}")
+
+            if not mapped_cols['security_id'] or not mapped_cols['trading_symbol']:
+                logger.warning("Essential columns not detected automatically. Running debug preview to help.")
+                await self.debug_instruments_preview(max_rows=10)
+                return False
+
+            rows = list(reader)
+            total_rows = len(rows)
+            logger.info(f"Total rows in instruments CSV: {total_rows}")
+
+            found_count = 0
+            for symbol, info in STOCKS_INDICES.items():
+                target_segment = info['segment']
+                target_symbol_name = info['symbol'].strip()
+
+                found = False
+                for row in rows:
+                    try:
+                        trading_val = (row.get(mapped_cols['trading_symbol'], '') or '').strip()
+                        sec_id_val = (row.get(mapped_cols['security_id'], '') or '').strip()
+                        segment_val = (row.get(mapped_cols['segment'], '') or '').strip() if mapped_cols['segment'] else ''
+                        exch_val = (row.get(mapped_cols['exchange'], '') or '').strip() if mapped_cols['exchange'] else ''
+
+                        norm_trading = trading_val.replace('.', '').replace(' ', '').upper()
+                        norm_target = target_symbol_name.replace('.', '').replace(' ', '').upper()
+
+                        seg_match = False
+                        if target_segment == "IDX_I":
+                            if any(x in (segment_val.upper(), exch_val.upper()) for x in ['I', 'IDX_I', 'INDEX']):
+                                seg_match = True
+                            else:
+                                seg_match = True
+                        else:
+                            if any(x in (segment_val.upper(), exch_val.upper()) for x in ['E', 'NSE', 'NSE_EQ', 'EQ']):
+                                seg_match = True
+                            else:
+                                if 'NSE' in exch_val.upper() or mapped_cols['exchange'] is None:
+                                    seg_match = True
+
+                        if norm_trading == norm_target and seg_match and sec_id_val:
+                            try:
+                                sec_id_int = int(float(sec_id_val))
+                                self.security_id_map[symbol] = {
+                                    'security_id': sec_id_int,
+                                    'segment': target_segment,
+                                    'trading_symbol': trading_val
+                                }
+                                found = True
+                                found_count += 1
+                                break
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+
+                if not found:
+                    logger.warning(f"Could not find equity entry for {symbol} in master file.")
+
+            logger.info(f"Total {found_count} F&O securities loaded.")
+            if found_count == 0:
+                logger.warning("No securities found — CSV may use unexpected column names/values. Use debug_instruments_preview to inspect.")
+                return False
+
+            return True
 
         except Exception as e:
             logger.error(f"Error loading security IDs: {e}")
@@ -337,7 +444,7 @@ class DhanOptionChainBot:
             return None
 
     # --------------------
-    # Option chain helpers (same as before)
+    # Option chain helpers
     # --------------------
     def get_nearest_expiry(self, security_id, segment):
         try:
@@ -466,7 +573,6 @@ class DhanOptionChainBot:
         if not self.gemini_client:
             return {"error": "Gemini client not configured"}
 
-        # Rate limit: ensure at least gemini_min_interval seconds between calls
         async with self.gemini_semaphore:
             now = time.time()
             elapsed = now - self._last_gemini_call
@@ -474,15 +580,8 @@ class DhanOptionChainBot:
                 to_wait = self.gemini_min_interval - elapsed
                 await asyncio.sleep(to_wait)
 
-            # run blocking call in thread
             result = await asyncio.to_thread(self._call_gemini_sync, image_buf, prompt_text)
-
-            # record last call time
             self._last_gemini_call = time.time()
-
-            # enforce at least 1 second between calls by sleeping a small amount (redundant with above)
-            await asyncio.sleep(0)  # just yield
-
             return result
 
     def _call_gemini_sync(self, image_buf, prompt_text, model="gemini-2.5-flash-image"):
@@ -491,51 +590,47 @@ class DhanOptionChainBot:
             if genai is None:
                 return {"error": "google-genai library not installed"}
 
-            # image bytes -> PIL -> base64 optional (genai supports passing a PIL Image directly in some clients)
-            img = Image.open(image_buf)
-            # Ensure buffer pointer
             image_buf.seek(0)
+            img = Image.open(image_buf).convert("RGB")
 
-            # Build contents: prompt text then image
-            # Many genai client examples show: client.generate_content(model=..., contents=[prompt, image])
             try:
+                # Preferred modern method (may vary by genai version)
                 response = self.gemini_client.models.generate_content(
                     model=model,
                     contents=[prompt_text, img],
-                    # you can tune temperature, max_output_tokens if needed
                 )
-            except Exception as e:
-                # fallback to older entrypoint if library version differs
+            except Exception:
+                # Fallback: older generate style
                 try:
                     response = self.gemini_client.generate(
                         model=model,
                         input=[{"content": prompt_text, "image": {"mime": "image/png", "data": base64.b64encode(image_buf.getvalue()).decode()}}]
                     )
-                except Exception as e2:
-                    return {"error": f"Gemini call failure: {e}; fallback failed: {e2}"}
+                except Exception as e:
+                    return {"error": f"Gemini call failure: {e}"}
 
-            # Parse response: defensive
             raw_text = ""
             json_obj = None
             try:
-                # many responses: response.candidates[0].content.parts etc.
-                # Try common paths:
                 if hasattr(response, "candidates") and len(response.candidates) > 0:
-                    parts = getattr(response.candidates[0], "content", None) or getattr(response.candidates[0], "content", None)
-                    # sometimes content is string
-                    if isinstance(parts, str):
-                        raw_text = parts
+                    cand = response.candidates[0]
+                    content = getattr(cand, "content", None)
+                    if isinstance(content, str):
+                        raw_text = content
                     else:
-                        # try to concatenate text parts
+                        # try to extract text parts
                         try:
-                            if hasattr(parts, "parts"):
-                                text_parts = []
-                                for p in parts.parts:
+                            parts = getattr(content, "parts", None)
+                            if parts:
+                                texts = []
+                                for p in parts:
                                     if getattr(p, "text", None):
-                                        text_parts.append(p.text)
-                                raw_text = "\n".join(text_parts)
+                                        texts.append(p.text)
+                                raw_text = "\n".join(texts)
+                            else:
+                                raw_text = str(cand)
                         except Exception:
-                            raw_text = str(response.candidates[0])
+                            raw_text = str(cand)
                 elif hasattr(response, "output"):
                     raw_text = str(response.output)
                 elif hasattr(response, "text"):
@@ -545,8 +640,7 @@ class DhanOptionChainBot:
             except Exception:
                 raw_text = str(response)
 
-            # Try extract JSON object inside raw_text
-            m = None
+            # Try extract JSON from raw_text
             try:
                 import re
                 m = re.search(r'(\{[\s\S]*\})', raw_text)
@@ -601,7 +695,7 @@ class DhanOptionChainBot:
                     chart_buf = self.create_candlestick_chart(candles, symbol, spot_price)
 
                 # Send chart image first (if available)
-                if chart_buf:
+                if chart_buf and self.bot:
                     try:
                         await self.bot.send_photo(
                             chat_id=TELEGRAM_CHAT_ID,
@@ -609,14 +703,13 @@ class DhanOptionChainBot:
                             caption=f"📊 {symbol} - Last {len(candles)} Candles Chart"
                         )
                         logger.info(f"✅ {symbol} chart sent")
-                        # reset buffer pointer for Gemini usage
                         chart_buf.seek(0)
                     except Exception as e:
                         logger.error(f"Error sending chart to Telegram for {symbol}: {e}")
 
                 # Prepare option chain message and send
                 message = self.format_option_chain_message(symbol, oc_data, expiry)
-                if message:
+                if message and self.bot:
                     try:
                         await self.bot.send_message(
                             chat_id=TELEGRAM_CHAT_ID,
@@ -630,11 +723,9 @@ class DhanOptionChainBot:
                 # Gemini analysis: if configured, send chart + structured prompt
                 if chart_buf and self.gemini_client:
                     try:
-                        # Build a concise prompt that includes option-chain context and candles summary
-                        # For speed, include only a short summary: spot, ATM, top OI strikes
                         oc = oc_data.get('oc', {})
                         spot = spot_price
-                        # compute top 3 OI strikes on CE and PE (best-effort)
+                        # compute top 3 OI strikes on CE and PE
                         try:
                             strike_items = []
                             for k, v in oc.items():
@@ -645,12 +736,12 @@ class DhanOptionChainBot:
                                     strike_items.append((strike_val, ce_oi, pe_oi))
                                 except Exception:
                                     continue
-                            # sort by max OI
                             strike_items_sorted = sorted(strike_items, key=lambda x: max(x[1], x[2]), reverse=True)
                             top_oi = strike_items_sorted[:3]
                             top_oi_summary = ", ".join([f"{int(s[0])}(CE_OI={int(s[1])},PE_OI={int(s[2])})" for s in top_oi])
                         except Exception:
                             top_oi_summary = ""
+
                         prompt_text = (
                             "You are an experienced technical market analyst. "
                             "Analyze the attached 5-minute candlestick chart (image) along with the following option-chain context. "
@@ -669,11 +760,9 @@ class DhanOptionChainBot:
                             if gemini_result.get('error'):
                                 logger.error(f"Gemini error for {symbol}: {gemini_result.get('error')}")
                             else:
-                                # Prepare message: if json present, pretty-print; else raw_text
                                 if gemini_result.get('json'):
                                     pretty = json.dumps(gemini_result['json'], indent=2)
                                     txt = f"🧠 *Gemini Vision Analysis — {symbol}*\n```\n{pretty}\n```\n"
-                                    # also add summary if available
                                     try:
                                         summ = gemini_result['json'].get('summary', None)
                                         if summ:
@@ -683,12 +772,12 @@ class DhanOptionChainBot:
                                 else:
                                     raw = gemini_result.get('raw_text', '')
                                     txt = f"🧠 *Gemini Vision Analysis — {symbol}*\n{raw}\n"
-                                # send to Telegram
-                                await self.bot.send_message(
-                                    chat_id=TELEGRAM_CHAT_ID,
-                                    text=txt,
-                                    parse_mode='Markdown'
-                                )
+                                if self.bot:
+                                    await self.bot.send_message(
+                                        chat_id=TELEGRAM_CHAT_ID,
+                                        text=txt,
+                                        parse_mode='Markdown'
+                                    )
                     except Exception as e:
                         logger.error(f"Error during Gemini analysis for {symbol}: {e}")
 
@@ -713,6 +802,10 @@ class DhanOptionChainBot:
         await self.send_startup_message()
 
         all_symbols = list(self.security_id_map.keys())
+        if not all_symbols:
+            logger.error("No symbols to track. Exiting.")
+            return
+
         batch_size = 5
         batches = [all_symbols[i:i+batch_size] for i in range(0, len(all_symbols), batch_size)]
 
@@ -755,15 +848,15 @@ class DhanOptionChainBot:
             msg += "✅ Powered by DhanHQ API v2\n\n"
             msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
 
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
-            )
-            logger.info("Startup message sent")
+            if self.bot:
+                await self.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=msg,
+                    parse_mode='Markdown'
+                )
+            logger.info("Startup message sent (if bot configured)")
         except Exception as e:
             logger.error(f"Error sending startup message: {e}")
-
 
 # ========================
 # BOT RUN करा
