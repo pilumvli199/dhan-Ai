@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# main.py - Dhan Option Chain Bot with Gemini vision analysis (robust loader + 1 req/sec limit)
 import asyncio
 import os
 from telegram import Bot
@@ -11,18 +9,11 @@ import io
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import mplfinance as mpf
 import pandas as pd
-import base64
-import json
-import time
+import google.generativeai as genai
 from PIL import Image
-
-# Gemini client (google-genai)
-try:
-    from google import genai
-except Exception:
-    genai = None
 
 # Logging setup
 logging.basicConfig(
@@ -32,13 +23,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========================
-# CONFIGURATION (env vars)
+# CONFIGURATION
 # ========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # preferred for free-tier API key use
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
@@ -49,12 +40,13 @@ DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 DHAN_HISTORICAL_URL = f"{DHAN_API_BASE}/v2/charts/historical"
 DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
 
-# Stock/Index List - Symbol mapping
+# Stock/Index List
 STOCKS_INDICES = {
     # Indices
     "NIFTY 50": {"symbol": "NIFTY 50", "segment": "IDX_I"},
     "NIFTY BANK": {"symbol": "NIFTY BANK", "segment": "IDX_I"},
     "SENSEX": {"symbol": "SENSEX", "segment": "IDX_I"},
+    
     # Stocks
     "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ"},
     "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ"},
@@ -85,12 +77,328 @@ STOCKS_INDICES = {
 }
 
 # ========================
+# TECHNICAL ANALYSIS HELPER
+# ========================
+class TechnicalAnalyzer:
+    """Candlestick data analyze करतो"""
+    
+    @staticmethod
+    def calculate_indicators(candles):
+        """Technical indicators calculate करतो"""
+        try:
+            if not candles or len(candles) < 20:
+                return None
+            
+            closes = [c['close'] for c in candles[-50:]]
+            highs = [c['high'] for c in candles[-50:]]
+            lows = [c['low'] for c in candles[-50:]]
+            volumes = [c['volume'] for c in candles[-50:]]
+            
+            # Simple Moving Averages
+            sma_20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
+            sma_50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
+            
+            # RSI (14 period)
+            rsi = TechnicalAnalyzer._calculate_rsi(closes, 14)
+            
+            # Support/Resistance (last 50 candles)
+            resistance = max(highs[-50:]) if len(highs) >= 50 else max(highs)
+            support = min(lows[-50:]) if len(lows) >= 50 else min(lows)
+            
+            # Volume analysis
+            avg_volume = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else sum(volumes) / len(volumes)
+            current_volume = volumes[-1]
+            volume_spike = current_volume > (avg_volume * 1.5)
+            
+            # Trend detection
+            if sma_20 and sma_50:
+                trend = "BULLISH" if sma_20 > sma_50 else "BEARISH"
+            else:
+                trend = "SIDEWAYS"
+            
+            return {
+                'sma_20': round(sma_20, 2) if sma_20 else None,
+                'sma_50': round(sma_50, 2) if sma_50 else None,
+                'rsi': round(rsi, 2) if rsi else None,
+                'support': round(support, 2),
+                'resistance': round(resistance, 2),
+                'trend': trend,
+                'volume_spike': volume_spike,
+                'avg_volume': int(avg_volume)
+            }
+        except Exception as e:
+            logger.error(f"Indicator calculation error: {e}")
+            return None
+    
+    @staticmethod
+    def _calculate_rsi(prices, period=14):
+        """RSI calculate करतो"""
+        try:
+            if len(prices) < period + 1:
+                return None
+            
+            gains = []
+            losses = []
+            
+            for i in range(1, len(prices)):
+                change = prices[i] - prices[i-1]
+                if change > 0:
+                    gains.append(change)
+                    losses.append(0)
+                else:
+                    gains.append(0)
+                    losses.append(abs(change))
+            
+            if len(gains) < period:
+                return None
+            
+            avg_gain = sum(gains[-period:]) / period
+            avg_loss = sum(losses[-period:]) / period
+            
+            if avg_loss == 0:
+                return 100
+            
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+            
+            return rsi
+        except:
+            return None
+    
+    @staticmethod
+    def detect_candlestick_patterns(candles):
+        """Candlestick patterns detect करतो"""
+        patterns = []
+        
+        if len(candles) < 3:
+            return patterns
+        
+        last = candles[-1]
+        prev = candles[-2]
+        prev2 = candles[-3] if len(candles) >= 3 else None
+        
+        # Doji
+        body = abs(last['close'] - last['open'])
+        range_size = last['high'] - last['low']
+        if body < (range_size * 0.1) and range_size > 0:
+            patterns.append("🔵 DOJI (Indecision)")
+        
+        # Hammer
+        if last['close'] > last['open']:
+            lower_wick = last['open'] - last['low']
+            upper_wick = last['high'] - last['close']
+            body = last['close'] - last['open']
+            if lower_wick > (body * 2) and upper_wick < body:
+                patterns.append("🔨 HAMMER (Bullish Reversal)")
+        
+        # Shooting Star
+        if last['close'] < last['open']:
+            upper_wick = last['high'] - last['open']
+            lower_wick = last['close'] - last['low']
+            body = last['open'] - last['close']
+            if upper_wick > (body * 2) and lower_wick < body:
+                patterns.append("⭐ SHOOTING STAR (Bearish Reversal)")
+        
+        # Bullish Engulfing
+        if prev['close'] < prev['open'] and last['close'] > last['open']:
+            if last['open'] < prev['close'] and last['close'] > prev['open']:
+                patterns.append("🟢 BULLISH ENGULFING (Strong Buy)")
+        
+        # Bearish Engulfing
+        if prev['close'] > prev['open'] and last['close'] < last['open']:
+            if last['open'] > prev['close'] and last['close'] < prev['open']:
+                patterns.append("🔴 BEARISH ENGULFING (Strong Sell)")
+        
+        # Morning Star (3 candles)
+        if prev2:
+            if (prev2['close'] < prev2['open'] and 
+                abs(prev['close'] - prev['open']) < (prev['high'] - prev['low']) * 0.3 and
+                last['close'] > last['open'] and
+                last['close'] > (prev2['open'] + prev2['close']) / 2):
+                patterns.append("🌅 MORNING STAR (Bullish Reversal)")
+        
+        # Evening Star (3 candles)
+        if prev2:
+            if (prev2['close'] > prev2['open'] and
+                abs(prev['close'] - prev['open']) < (prev['high'] - prev['low']) * 0.3 and
+                last['close'] < last['open'] and
+                last['close'] < (prev2['open'] + prev2['close']) / 2):
+                patterns.append("🌆 EVENING STAR (Bearish Reversal)")
+        
+        return patterns
+
+# ========================
+# GEMINI VISION ANALYZER
+# ========================
+class GeminiChartAnalyzer:
+    def __init__(self, api_key):
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.request_count = 0
+        self.last_reset_time = datetime.now()
+        self.max_rpm = 15
+        
+    async def analyze_comprehensive(self, image_buffer, symbol, spot_price, 
+                                   option_data, technical_data, candlestick_patterns):
+        """सर्व data एकत्र analyze करतो"""
+        try:
+            await self._check_rate_limit()
+            
+            image_buffer.seek(0)
+            image = Image.open(image_buffer)
+            
+            # Option chain summary तयार करतो
+            oc_summary = self._prepare_option_chain_summary(option_data)
+            
+            # Technical indicators summary
+            tech_summary = self._prepare_technical_summary(technical_data)
+            
+            # Candlestick patterns
+            pattern_summary = "\n".join(candlestick_patterns) if candlestick_patterns else "No significant patterns"
+            
+            # Comprehensive prompt
+            prompt = f"""
+You are an EXPERT Indian stock market trader analyzing {symbol} (₹{spot_price:,.2f}).
+
+📊 **CHART ANALYSIS:**
+Analyze the candlestick chart image for visual patterns like:
+- Head & Shoulders, Double Top/Bottom, Triangles, Wedges, Channels
+- Trend lines, breakouts, breakdowns
+- Volume patterns and price action
+
+💹 **TECHNICAL DATA PROVIDED:**
+{tech_summary}
+
+🕯️ **CANDLESTICK PATTERNS DETECTED:**
+{pattern_summary}
+
+📉 **OPTION CHAIN DATA:**
+{oc_summary}
+
+**GIVE YOUR ANALYSIS IN THIS FORMAT:**
+
+🎯 **MARKET OUTLOOK:** [Bullish/Bearish/Neutral with reasoning]
+
+📊 **CHART PATTERN:** [What visual pattern you see in chart + significance]
+
+📈 **TECHNICAL CONFIRMATION:**
+- Trend: [Align with SMA/RSI data]
+- Momentum: [Based on RSI + Volume]
+- Support/Resistance: [Key levels]
+
+🔥 **OPTION MARKET SENTIMENT:**
+[Analysis based on CE/PE OI, volume, IV changes]
+
+🎯 **TRADE SETUP (If tradeable):**
+✅ **Signal:** BUY/SELL/HOLD
+💰 **Entry:** ₹[price]
+🎯 **Target 1:** ₹[price] 
+🎯 **Target 2:** ₹[price]
+🛑 **Stop Loss:** ₹[price]
+📊 **Risk:Reward:** [ratio]
+⏰ **Timeframe:** [Intraday/Swing/Positional]
+
+⚠️ **RISK LEVEL:** [Low/Medium/High] - [Why?]
+
+🔮 **KEY POINTS:**
+- [Important observation 1]
+- [Important observation 2]
+- [Important observation 3]
+
+Keep it CONCISE, ACTIONABLE, and in HINDI+ENGLISH mix if needed for clarity.
+Only give trade setup if confidence > 70%.
+"""
+            
+            response = self.model.generate_content([prompt, image])
+            
+            self.request_count += 1
+            logger.info(f"✅ Gemini comprehensive analysis for {symbol} (#{self.request_count})")
+            
+            return response.text
+            
+        except Exception as e:
+            logger.error(f"Gemini analysis error for {symbol}: {e}")
+            return None
+    
+    def _prepare_option_chain_summary(self, option_data):
+        """Option chain data summarize करतो"""
+        try:
+            if not option_data or 'oc' not in option_data:
+                return "Option data not available"
+            
+            spot = option_data.get('last_price', 0)
+            oc = option_data.get('oc', {})
+            
+            # ATM strike शोधतो
+            strikes = sorted([float(s) for s in oc.keys()])
+            atm_strike = min(strikes, key=lambda x: abs(x - spot))
+            
+            atm_data = oc.get(f"{atm_strike:.6f}", {})
+            ce = atm_data.get('ce', {})
+            pe = atm_data.get('pe', {})
+            
+            # CE/PE Ratio
+            ce_oi = ce.get('oi', 0)
+            pe_oi = pe.get('oi', 0)
+            pcr = round(pe_oi / ce_oi, 2) if ce_oi > 0 else 0
+            
+            # IV
+            ce_iv = ce.get('implied_volatility', 0)
+            pe_iv = pe.get('implied_volatility', 0)
+            
+            summary = f"""
+Spot: ₹{spot:,.2f} | ATM: ₹{atm_strike:,.0f}
+CE OI: {ce_oi/1000:.0f}K | PE OI: {pe_oi/1000:.0f}K
+PCR Ratio: {pcr} (>1=Bullish, <1=Bearish)
+CE IV: {ce_iv:.1f}% | PE IV: {pe_iv:.1f}%
+CE LTP: ₹{ce.get('last_price', 0):.1f} | PE LTP: ₹{pe.get('last_price', 0):.1f}
+"""
+            return summary.strip()
+        except Exception as e:
+            return "Option summary error"
+    
+    def _prepare_technical_summary(self, tech_data):
+        """Technical data format करतो"""
+        if not tech_data:
+            return "Technical data not available"
+        
+        summary = f"""
+SMA 20: ₹{tech_data.get('sma_20', 'N/A')} | SMA 50: ₹{tech_data.get('sma_50', 'N/A')}
+RSI(14): {tech_data.get('rsi', 'N/A')} (>70=Overbought, <30=Oversold)
+Trend: {tech_data.get('trend', 'N/A')}
+Support: ₹{tech_data.get('support', 'N/A')} | Resistance: ₹{tech_data.get('resistance', 'N/A')}
+Volume Spike: {'YES ⚠️' if tech_data.get('volume_spike') else 'No'}
+Avg Volume: {tech_data.get('avg_volume', 0):,}
+"""
+        return summary.strip()
+    
+    async def _check_rate_limit(self):
+        """Rate limit manage करतो"""
+        current_time = datetime.now()
+        time_diff = (current_time - self.last_reset_time).total_seconds()
+        
+        if time_diff >= 60:
+            self.request_count = 0
+            self.last_reset_time = current_time
+            logger.info("🔄 Rate limit reset")
+        
+        if self.request_count >= self.max_rpm:
+            wait_time = 60 - time_diff
+            if wait_time > 0:
+                logger.warning(f"⏳ Rate limit hit. Waiting {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time + 1)
+                self.request_count = 0
+                self.last_reset_time = datetime.now()
+        
+        await asyncio.sleep(4)
+
+
+# ========================
 # BOT CODE
 # ========================
-
 class DhanOptionChainBot:
     def __init__(self):
-        self.bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+        self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
         self.headers = {
             'access-token': DHAN_ACCESS_TOKEN,
@@ -99,212 +407,79 @@ class DhanOptionChainBot:
             'Accept': 'application/json'
         }
         self.security_id_map = {}
-        logger.info("Bot initialized successfully")
-
-        # Gemini related
-        self.gemini_client = None
-        self.gemini_semaphore = asyncio.Semaphore(1)  # allow 1 concurrent Gemini call
-        self.gemini_min_interval = 1.0  # seconds between calls
-        self._last_gemini_call = 0.0
-
-        # init genai client if key present
-        if GEMINI_API_KEY:
-            if genai is None:
-                logger.warning("google-genai library not installed; Gemini integration won't work until installed.")
-            else:
-                try:
-                    # instantiate client with API key (works for free-tier API key)
-                    self.gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-                    logger.info("Gemini client initialized with API key")
-                except Exception as e:
-                    logger.error(f"Failed to init Gemini client: {e}")
-        else:
-            logger.info("No GEMINI_API_KEY found - Gemini analysis disabled")
-
-    # --------------------
-    # Debug preview for instruments CSV
-    # --------------------
-    async def debug_instruments_preview(self, max_rows=20):
-        """
-        Downloads the master CSV and logs header + first max_rows rows (useful for debugging).
-        """
-        try:
-            logger.info("Downloading Dhan instruments file for debug preview...")
-            resp = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
-            logger.info(f"Download status: {resp.status_code}; bytes={len(resp.content) if resp.content else 0}")
-            if resp.status_code != 200:
-                logger.warning("Could not download instruments CSV (non-200).")
-                return None
-
-            text = resp.content
-            decoded = None
-            for enc in ("utf-8-sig", "utf-8", "latin-1"):
-                try:
-                    decoded = text.decode(enc)
-                    logger.info(f"Decoded CSV with encoding: {enc}")
-                    break
-                except Exception:
-                    decoded = None
-            if not decoded:
-                logger.error("Failed to decode CSV with common encodings.")
-                return None
-
-            lines = decoded.splitlines()
-            if not lines:
-                logger.warning("CSV is empty after decoding.")
-                return None
-
-            header_line = lines[0]
-            logger.info(f"CSV Header Line: {header_line}")
-            logger.info("---- First rows preview ----")
-            for i, ln in enumerate(lines[1:1+max_rows], start=1):
-                logger.info(f"ROW {i}: {ln[:400]}")
-            logger.info("---- End preview ----")
-            return decoded
-
-        except Exception as e:
-            logger.error(f"Error in debug_instruments_preview: {e}")
-            return None
-
-    # --------------------
-    # Robust loader for security IDs
-    # --------------------
+        self.gemini_analyzer = GeminiChartAnalyzer(GEMINI_API_KEY)
+        self.tech_analyzer = TechnicalAnalyzer()
+        logger.info("🤖 Bot initialized with comprehensive analysis")
+    
     async def load_security_ids(self):
-        """
-        Robust loader: tries multiple possible header names, strips BOM, case-insensitive matching,
-        and logs useful warnings when symbol not found.
-        """
+        """Security IDs load करतो"""
         try:
-            logger.info("Loading security IDs from Dhan (robust loader)...")
-            resp = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
-            if resp.status_code != 200:
-                logger.error(f"Failed to download instruments CSV: HTTP {resp.status_code}")
-                return False
-
-            content = resp.content
-            csv_text = None
-            for enc in ("utf-8-sig", "utf-8", "latin-1"):
-                try:
-                    csv_text = content.decode(enc)
-                    logger.info(f"Decoded instruments CSV using encoding: {enc}")
-                    break
-                except Exception:
-                    csv_text = None
-            if csv_text is None:
-                logger.error("Unable to decode instruments CSV with common encodings.")
-                return False
-
-            lines = csv_text.splitlines()
-            reader = csv.DictReader(lines)
-            headers = reader.fieldnames or []
-            headers_normalized = [h.strip().lower() for h in headers]
-            logger.info(f"Detected CSV headers ({len(headers)}): {headers}")
-
-            # Candidate column names (common variants)
-            possible_cols = {
-                'trading_symbol': ['sem_trading_symbol', 'trading_symbol', 'symbol', 'sc_name', 'tradingsymbol'],
-                'security_id': ['sem_smst_security_id', 'smst_security_id', 'security_id', 'smst_id', 'scripcode'],
-                'segment': ['sem_segment', 'segment', 'seg', 'seg_type'],
-                'exchange': ['sem_exm_exch_id', 'exchange', 'exm_exch_id', 'exch', 'ex'],
-            }
-
-            mapped_cols = {}
-            for key, variants in possible_cols.items():
-                mapped_cols[key] = None
-                for v in variants:
-                    if v.lower() in headers_normalized:
-                        idx = headers_normalized.index(v.lower())
-                        mapped_cols[key] = headers[idx]
-                        break
-
-            logger.info(f"Mapped columns: {mapped_cols}")
-
-            if not mapped_cols['security_id'] or not mapped_cols['trading_symbol']:
-                logger.warning("Essential columns not detected automatically. Running debug preview to help.")
-                await self.debug_instruments_preview(max_rows=10)
-                return False
-
-            rows = list(reader)
-            total_rows = len(rows)
-            logger.info(f"Total rows in instruments CSV: {total_rows}")
-
-            found_count = 0
-            for symbol, info in STOCKS_INDICES.items():
-                target_segment = info['segment']
-                target_symbol_name = info['symbol'].strip()
-
-                found = False
-                for row in rows:
-                    try:
-                        trading_val = (row.get(mapped_cols['trading_symbol'], '') or '').strip()
-                        sec_id_val = (row.get(mapped_cols['security_id'], '') or '').strip()
-                        segment_val = (row.get(mapped_cols['segment'], '') or '').strip() if mapped_cols['segment'] else ''
-                        exch_val = (row.get(mapped_cols['exchange'], '') or '').strip() if mapped_cols['exchange'] else ''
-
-                        norm_trading = trading_val.replace('.', '').replace(' ', '').upper()
-                        norm_target = target_symbol_name.replace('.', '').replace(' ', '').upper()
-
-                        seg_match = False
-                        if target_segment == "IDX_I":
-                            if any(x in (segment_val.upper(), exch_val.upper()) for x in ['I', 'IDX_I', 'INDEX']):
-                                seg_match = True
+            logger.info("Loading security IDs...")
+            response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
+            
+            if response.status_code == 200:
+                csv_data = response.text.split('\n')
+                reader = csv.DictReader(csv_data)
+                
+                for symbol, info in STOCKS_INDICES.items():
+                    segment = info['segment']
+                    symbol_name = info['symbol']
+                    
+                    for row in reader:
+                        try:
+                            if segment == "IDX_I":
+                                if (row.get('SEM_SEGMENT') == 'I' and 
+                                    row.get('SEM_TRADING_SYMBOL') == symbol_name):
+                                    sec_id = row.get('SEM_SMST_SECURITY_ID')
+                                    if sec_id:
+                                        self.security_id_map[symbol] = {
+                                            'security_id': int(sec_id),
+                                            'segment': segment,
+                                            'trading_symbol': symbol_name
+                                        }
+                                        logger.info(f"✅ {symbol}: {sec_id}")
+                                        break
                             else:
-                                seg_match = True
-                        else:
-                            if any(x in (segment_val.upper(), exch_val.upper()) for x in ['E', 'NSE', 'NSE_EQ', 'EQ']):
-                                seg_match = True
-                            else:
-                                if 'NSE' in exch_val.upper() or mapped_cols['exchange'] is None:
-                                    seg_match = True
-
-                        if norm_trading == norm_target and seg_match and sec_id_val:
-                            try:
-                                sec_id_int = int(float(sec_id_val))
-                                self.security_id_map[symbol] = {
-                                    'security_id': sec_id_int,
-                                    'segment': target_segment,
-                                    'trading_symbol': trading_val
-                                }
-                                found = True
-                                found_count += 1
-                                break
-                            except Exception:
-                                continue
-                    except Exception:
-                        continue
-
-                if not found:
-                    logger.warning(f"Could not find equity entry for {symbol} in master file.")
-
-            logger.info(f"Total {found_count} F&O securities loaded.")
-            if found_count == 0:
-                logger.warning("No securities found — CSV may use unexpected column names/values. Use debug_instruments_preview to inspect.")
-                return False
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Error loading security IDs: {e}")
+                                if (row.get('SEM_SEGMENT') == 'E' and 
+                                    row.get('SEM_TRADING_SYMBOL') == symbol_name and
+                                    row.get('SEM_EXM_EXCH_ID') == 'NSE'):
+                                    sec_id = row.get('SEM_SMST_SECURITY_ID')
+                                    if sec_id:
+                                        self.security_id_map[symbol] = {
+                                            'security_id': int(sec_id),
+                                            'segment': segment,
+                                            'trading_symbol': symbol_name
+                                        }
+                                        logger.info(f"✅ {symbol}: {sec_id}")
+                                        break
+                        except:
+                            continue
+                    
+                    csv_data_reset = response.text.split('\n')
+                    reader = csv.DictReader(csv_data_reset)
+                
+                logger.info(f"✅ {len(self.security_id_map)} securities loaded")
+                return True
             return False
-
-    # --------------------
-    # Historical candles
-    # --------------------
+        except Exception as e:
+            logger.error(f"Error loading IDs: {e}")
+            return False
+    
     def get_historical_data(self, security_id, segment, symbol):
-        """Last 5 days चे सर्व 5-minute candles घेतो"""
+        """Historical candles घेतो"""
         try:
-            from datetime import datetime, timedelta
-
+            from datetime import timedelta
+            
             if segment == "IDX_I":
                 exch_seg = "IDX_I"
                 instrument = "INDEX"
             else:
                 exch_seg = "NSE_EQ"
                 instrument = "EQUITY"
-
+            
             to_date = datetime.now()
             from_date = to_date - timedelta(days=7)
-
+            
             payload = {
                 "securityId": str(security_id),
                 "exchangeSegment": exch_seg,
@@ -313,563 +488,478 @@ class DhanOptionChainBot:
                 "fromDate": from_date.strftime("%Y-%m-%d"),
                 "toDate": to_date.strftime("%Y-%m-%d")
             }
-
-            logger.info(f"Intraday API call for {symbol}: {payload}")
-
+            
             response = requests.post(
                 DHAN_INTRADAY_URL,
                 json=payload,
                 headers=self.headers,
                 timeout=15
             )
-
-            logger.info(f"{symbol} Intraday response status: {response.status_code}")
-
+            
             if response.status_code == 200:
                 data = response.json()
-                if 'open' in data and 'high' in data and 'low' in data and 'close' in data:
+                
+                if 'open' in data:
                     opens = data.get('open', [])
                     highs = data.get('high', [])
                     lows = data.get('low', [])
                     closes = data.get('close', [])
                     volumes = data.get('volume', [])
                     timestamps = data.get('start_Time', [])
-
-                    logger.info(f"{symbol}: Total arrays length - Open:{len(opens)}, Time:{len(timestamps)}")
-
+                    
                     candles = []
                     for i in range(len(opens)):
                         candles.append({
                             'timestamp': timestamps[i] if i < len(timestamps) else '',
-                            'open': opens[i] if i < len(opens) else 0,
-                            'high': highs[i] if i < len(highs) else 0,
-                            'low': lows[i] if i < len(lows) else 0,
-                            'close': closes[i] if i < len(closes) else 0,
-                            'volume': volumes[i] if i < len(volumes) else 0
+                            'open': opens[i],
+                            'high': highs[i],
+                            'low': lows[i],
+                            'close': closes[i],
+                            'volume': volumes[i]
                         })
-
-                    logger.info(f"{symbol}: Returning ALL {len(candles)} candles from last 5 days (5 min)")
+                    
+                    logger.info(f"{symbol}: {len(candles)} candles fetched")
                     return candles
-                else:
-                    logger.warning(f"{symbol}: Invalid response format - {str(data)[:200]}")
-                    return None
-
-            logger.warning(f"{symbol}: Historical data नाही मिळाला - Status: {response.status_code}")
+            
             return None
-
         except Exception as e:
-            logger.error(f"Error getting historical data for {symbol}: {e}")
+            logger.error(f"Historical data error for {symbol}: {e}")
             return None
-
-    # --------------------
-    # Candlestick chart creation
-    # --------------------
+    
     def create_candlestick_chart(self, candles, symbol, spot_price):
-        """Candlestick chart तयार करतो and return io.BytesIO"""
+        """Enhanced chart"""
         try:
             df_data = []
             for candle in candles:
-                timestamp = candle.get('timestamp', candle.get('start_Time', ''))
+                timestamp = candle.get('timestamp', '')
                 df_data.append({
                     'Date': pd.to_datetime(timestamp) if timestamp else pd.Timestamp.now(),
-                    'Open': float(candle.get('open', 0)),
-                    'High': float(candle.get('high', 0)),
-                    'Low': float(candle.get('low', 0)),
-                    'Close': float(candle.get('close', 0)),
-                    'Volume': int(float(candle.get('volume', 0)))
+                    'Open': float(candle['open']),
+                    'High': float(candle['high']),
+                    'Low': float(candle['low']),
+                    'Close': float(candle['close']),
+                    'Volume': int(float(candle['volume']))
                 })
-
+            
             df = pd.DataFrame(df_data)
             df.set_index('Date', inplace=True)
-
+            
             if len(df) < 2:
-                logger.warning(f"{symbol}: Not enough candles ({len(df)}) for chart")
                 return None
-
+            
             mc = mpf.make_marketcolors(
-                up='#26a69a',
-                down='#ef5350',
+                up='#00ff88',
+                down='#ff3366',
                 edge='inherit',
                 wick='inherit',
                 volume='in'
             )
-
+            
             s = mpf.make_mpf_style(
                 marketcolors=mc,
                 gridstyle='-',
-                gridcolor='#333333',
-                facecolor='#1e1e1e',
-                figcolor='#1e1e1e',
-                gridaxis='both',
+                gridcolor='#2a2a2a',
+                facecolor='#0a0a0a',
+                figcolor='#0a0a0a',
                 y_on_right=False
             )
-
+            
             fig, axes = mpf.plot(
                 df,
                 type='candle',
                 style=s,
                 volume=True,
-                title=f'\n{symbol} - Last {len(candles)} Candles | Spot: ₹{spot_price:,.2f}',
+                title=f'\n{symbol} | ₹{spot_price:,.2f} | {len(candles)} Candles',
                 ylabel='Price (₹)',
-                ylabel_lower='Volume',
-                figsize=(12, 8),
+                ylabel_lower='Vol',
+                figsize=(14, 9),
                 returnfig=True,
                 tight_layout=True
             )
-
+            
             axes[0].set_title(
-                f'{symbol} - Last {len(candles)} Candles | Spot: ₹{spot_price:,.2f}',
-                color='white',
-                fontsize=14,
+                f'{symbol} | ₹{spot_price:,.2f} | {len(candles)} Candles (5min)',
+                color='#00ff88',
+                fontsize=16,
                 fontweight='bold',
                 pad=20
             )
-
+            
             for ax in axes:
-                ax.tick_params(colors='white', which='both')
-                for spine in ax.spines.values():
-                    spine.set_color('white')
+                ax.tick_params(colors='white')
+                ax.spines['bottom'].set_color('#444')
+                ax.spines['top'].set_color('#444')
+                ax.spines['left'].set_color('#444')
+                ax.spines['right'].set_color('#444')
                 ax.xaxis.label.set_color('white')
                 ax.yaxis.label.set_color('white')
-
+            
             buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1e1e1e')
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#0a0a0a')
             buf.seek(0)
             plt.close(fig)
-
+            
             return buf
-
         except Exception as e:
-            logger.error(f"Error creating chart for {symbol}: {e}")
+            logger.error(f"Chart error for {symbol}: {e}")
             return None
-
-    # --------------------
-    # Option chain helpers
-    # --------------------
+    
     def get_nearest_expiry(self, security_id, segment):
+        """Expiry घेतो"""
         try:
             payload = {
                 "UnderlyingScrip": security_id,
                 "UnderlyingSeg": segment
             }
-
+            
             response = requests.post(
                 DHAN_EXPIRY_LIST_URL,
                 json=payload,
                 headers=self.headers,
                 timeout=10
             )
-
+            
             if response.status_code == 200:
                 data = response.json()
                 if data.get('status') == 'success' and data.get('data'):
-                    expiries = data['data']
-                    if expiries:
-                        return expiries[0]
+                    return data['data'][0]
             return None
-
         except Exception as e:
-            logger.error(f"Error getting expiry: {e}")
+            logger.error(f"Expiry error: {e}")
             return None
-
+    
     def get_option_chain(self, security_id, segment, expiry):
+        """Option chain घेतो"""
         try:
             payload = {
                 "UnderlyingScrip": security_id,
                 "UnderlyingSeg": segment,
                 "Expiry": expiry
             }
-
+            
             response = requests.post(
                 DHAN_OPTION_CHAIN_URL,
                 json=payload,
                 headers=self.headers,
                 timeout=15
             )
-
+            
             if response.status_code == 200:
                 data = response.json()
                 if data.get('data'):
                     return data['data']
-
             return None
-
         except Exception as e:
-            logger.error(f"Error getting option chain: {e}")
+            logger.error(f"Option chain error: {e}")
             return None
-
+    
     def format_option_chain_message(self, symbol, data, expiry):
+        """Option chain format करतो"""
         try:
             spot_price = data.get('last_price', 0)
             oc_data = data.get('oc', {})
-
+            
             if not oc_data:
                 return None
-
+            
             strikes = sorted([float(s) for s in oc_data.keys()])
             atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
+            
             atm_idx = strikes.index(atm_strike)
             start_idx = max(0, atm_idx - 5)
             end_idx = min(len(strikes), atm_idx + 6)
             selected_strikes = strikes[start_idx:end_idx]
-
+            
             msg = f"📊 *{symbol} OPTION CHAIN*\n"
             msg += f"📅 Expiry: {expiry}\n"
             msg += f"💰 Spot: ₹{spot_price:,.2f}\n"
             msg += f"🎯 ATM: ₹{atm_strike:,.0f}\n\n"
-
+            
             msg += "```\n"
-            msg += "Strike   CE-LTP  CE-OI  CE-Vol  PE-LTP  PE-OI  PE-Vol\n"
-            msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
+            msg += "Strike   CE-LTP  CE-OI  PE-LTP  PE-OI\n"
+            msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            
             for strike in selected_strikes:
                 strike_key = f"{strike:.6f}"
                 strike_data = oc_data.get(strike_key, {})
-
+                
                 ce = strike_data.get('ce', {})
                 pe = strike_data.get('pe', {})
-
-                ce_ltp = ce.get('last_price', 0)
-                ce_oi = ce.get('oi', 0)
-                ce_vol = ce.get('volume', 0)
-
-                pe_ltp = pe.get('last_price', 0)
-                pe_oi = pe.get('oi', 0)
-                pe_vol = pe.get('volume', 0)
-
+                
                 atm_mark = "🔸" if strike == atm_strike else "  "
-
-                msg += f"{atm_mark}{strike:6.0f}  {ce_ltp:6.1f} {ce_oi/1000:6.0f}K {ce_vol/1000:6.0f}K  {pe_ltp:6.1f} {pe_oi/1000:6.0f}K {pe_vol/1000:6.0f}K\n"
-
-            msg += "```\n\n"
-
-            atm_data = oc_data.get(f"{atm_strike:.6f}", {})
-            if atm_data:
-                ce_greeks = atm_data.get('ce', {}).get('greeks', {})
-                pe_greeks = atm_data.get('pe', {}).get('greeks', {})
-                ce_iv = atm_data.get('ce', {}).get('implied_volatility', 0)
-                pe_iv = atm_data.get('pe', {}).get('implied_volatility', 0)
-
-                msg += "📈 *ATM Greeks & IV:*\n"
-                msg += f"CE: Δ={ce_greeks.get('delta', 0):.3f} Θ={ce_greeks.get('theta', 0):.2f} IV={ce_iv:.1f}%\n"
-                msg += f"PE: Δ={pe_greeks.get('delta', 0):.3f} Θ={pe_greeks.get('theta', 0):.2f} IV={pe_iv:.1f}%\n"
-
+                
+                msg += f"{atm_mark}{strike:6.0f}  {ce.get('last_price', 0):6.1f} {ce.get('oi', 0)/1000:5.0f}K  {pe.get('last_price', 0):6.1f} {pe.get('oi', 0)/1000:5.0f}K\n"
+            
+            msg += "```"
+            
             return msg
-
         except Exception as e:
-            logger.error(f"Error formatting message for {symbol}: {e}")
+            logger.error(f"Format error for {symbol}: {e}")
             return None
-
-    # --------------------
-    # Gemini analyze (async wrapper)
-    # --------------------
-    async def analyze_image_with_gemini_async(self, image_buf, prompt_text):
-        """
-        Async wrapper that ensures:
-          - only 1 call per self.gemini_min_interval seconds
-          - calls blocking genai client in a thread (asyncio.to_thread)
-        Returns parsed result dict: {'raw_text':..., 'json':...} or {'error':...}
-        """
-        if not self.gemini_client:
-            return {"error": "Gemini client not configured"}
-
-        async with self.gemini_semaphore:
-            now = time.time()
-            elapsed = now - self._last_gemini_call
-            if elapsed < self.gemini_min_interval:
-                to_wait = self.gemini_min_interval - elapsed
-                await asyncio.sleep(to_wait)
-
-            result = await asyncio.to_thread(self._call_gemini_sync, image_buf, prompt_text)
-            self._last_gemini_call = time.time()
-            return result
-
-    def _call_gemini_sync(self, image_buf, prompt_text, model="gemini-2.5-flash-image"):
-        """Blocking synchronous call to google-genai client. Returns dict."""
-        try:
-            if genai is None:
-                return {"error": "google-genai library not installed"}
-
-            image_buf.seek(0)
-            img = Image.open(image_buf).convert("RGB")
-
-            try:
-                # Preferred modern method (may vary by genai version)
-                response = self.gemini_client.models.generate_content(
-                    model=model,
-                    contents=[prompt_text, img],
-                )
-            except Exception:
-                # Fallback: older generate style
-                try:
-                    response = self.gemini_client.generate(
-                        model=model,
-                        input=[{"content": prompt_text, "image": {"mime": "image/png", "data": base64.b64encode(image_buf.getvalue()).decode()}}]
-                    )
-                except Exception as e:
-                    return {"error": f"Gemini call failure: {e}"}
-
-            raw_text = ""
-            json_obj = None
-            try:
-                if hasattr(response, "candidates") and len(response.candidates) > 0:
-                    cand = response.candidates[0]
-                    content = getattr(cand, "content", None)
-                    if isinstance(content, str):
-                        raw_text = content
-                    else:
-                        # try to extract text parts
-                        try:
-                            parts = getattr(content, "parts", None)
-                            if parts:
-                                texts = []
-                                for p in parts:
-                                    if getattr(p, "text", None):
-                                        texts.append(p.text)
-                                raw_text = "\n".join(texts)
-                            else:
-                                raw_text = str(cand)
-                        except Exception:
-                            raw_text = str(cand)
-                elif hasattr(response, "output"):
-                    raw_text = str(response.output)
-                elif hasattr(response, "text"):
-                    raw_text = response.text
-                else:
-                    raw_text = str(response)
-            except Exception:
-                raw_text = str(response)
-
-            # Try extract JSON from raw_text
-            try:
-                import re
-                m = re.search(r'(\{[\s\S]*\})', raw_text)
-                if m:
-                    try:
-                        json_obj = json.loads(m.group(1))
-                    except Exception:
-                        json_obj = None
-            except Exception:
-                json_obj = None
-
-            return {"raw_text": raw_text, "json": json_obj}
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    # --------------------
-    # send batch (modified to call Gemini)
-    # --------------------
+    
     async def send_option_chain_batch(self, symbols_batch):
-        """एका batch चे option chain data + chart पाठवतो and Gemini analysis करते"""
+        """Comprehensive analysis सह batch process करतो"""
         for symbol in symbols_batch:
             try:
                 if symbol not in self.security_id_map:
-                    logger.warning(f"Skipping {symbol} - No security ID")
+                    logger.warning(f"⚠️ {symbol} - No security ID")
                     continue
-
+                
                 info = self.security_id_map[symbol]
                 security_id = info['security_id']
                 segment = info['segment']
-
+                
+                logger.info(f"\n{'='*50}")
+                logger.info(f"🔍 Analyzing {symbol}...")
+                logger.info(f"{'='*50}")
+                
+                # 1. Expiry fetch करतो
                 expiry = self.get_nearest_expiry(security_id, segment)
                 if not expiry:
-                    logger.warning(f"{symbol}: Expiry नाही मिळाला")
+                    logger.warning(f"{symbol}: No expiry found")
                     continue
-
-                logger.info(f"Fetching data for {symbol} (Expiry: {expiry})...")
-
+                
+                # 2. Option chain data
                 oc_data = self.get_option_chain(security_id, segment, expiry)
                 if not oc_data:
-                    logger.warning(f"{symbol}: Option chain data नाही मिळाला")
+                    logger.warning(f"{symbol}: No option chain")
                     continue
-
+                
                 spot_price = oc_data.get('last_price', 0)
-
-                logger.info(f"Fetching historical candles for {symbol}...")
+                
+                # 3. Historical candles fetch करतो
+                logger.info(f"📊 Fetching candles for {symbol}...")
                 candles = self.get_historical_data(security_id, segment, symbol)
-
-                chart_buf = None
-                if candles:
-                    logger.info(f"Creating candlestick chart for {symbol}...")
-                    chart_buf = self.create_candlestick_chart(candles, symbol, spot_price)
-
-                # Send chart image first (if available)
-                if chart_buf and self.bot:
-                    try:
-                        await self.bot.send_photo(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            photo=chart_buf,
-                            caption=f"📊 {symbol} - Last {len(candles)} Candles Chart"
-                        )
-                        logger.info(f"✅ {symbol} chart sent")
-                        chart_buf.seek(0)
-                    except Exception as e:
-                        logger.error(f"Error sending chart to Telegram for {symbol}: {e}")
-
-                # Prepare option chain message and send
-                message = self.format_option_chain_message(symbol, oc_data, expiry)
-                if message and self.bot:
-                    try:
-                        await self.bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=message,
-                            parse_mode='Markdown'
-                        )
-                        logger.info(f"✅ {symbol} option chain sent")
-                    except Exception as e:
-                        logger.error(f"Error sending option chain message for {symbol}: {e}")
-
-                # Gemini analysis: if configured, send chart + structured prompt
-                if chart_buf and self.gemini_client:
-                    try:
-                        oc = oc_data.get('oc', {})
-                        spot = spot_price
-                        # compute top 3 OI strikes on CE and PE
-                        try:
-                            strike_items = []
-                            for k, v in oc.items():
-                                try:
-                                    strike_val = float(k)
-                                    ce_oi = v.get('ce', {}).get('oi', 0) or 0
-                                    pe_oi = v.get('pe', {}).get('oi', 0) or 0
-                                    strike_items.append((strike_val, ce_oi, pe_oi))
-                                except Exception:
-                                    continue
-                            strike_items_sorted = sorted(strike_items, key=lambda x: max(x[1], x[2]), reverse=True)
-                            top_oi = strike_items_sorted[:3]
-                            top_oi_summary = ", ".join([f"{int(s[0])}(CE_OI={int(s[1])},PE_OI={int(s[2])})" for s in top_oi])
-                        except Exception:
-                            top_oi_summary = ""
-
-                        prompt_text = (
-                            "You are an experienced technical market analyst. "
-                            "Analyze the attached 5-minute candlestick chart (image) along with the following option-chain context. "
-                            f"Spot={spot:.2f}. Top OI strikes: {top_oi_summary}. "
-                            "Please return a concise JSON with keys: trend (up/down/sideways), "
-                            "supports (list of approx prices), resistances (list), notable_patterns (list), "
-                            "volume_spikes (list), last_visible_price (approx), watch_levels (list of 2), "
-                            "and a short human readable summary under 'summary'. Do not provide financial advice."
-                        )
-
-                        logger.info(f"Sending to Gemini for {symbol} (rate-limited 1/s)...")
-                        gemini_result = await self.analyze_image_with_gemini_async(chart_buf, prompt_text)
-                        logger.info(f"Gemini result for {symbol}: {str(gemini_result)[:300]}")
-
-                        if gemini_result:
-                            if gemini_result.get('error'):
-                                logger.error(f"Gemini error for {symbol}: {gemini_result.get('error')}")
-                            else:
-                                if gemini_result.get('json'):
-                                    pretty = json.dumps(gemini_result['json'], indent=2)
-                                    txt = f"🧠 *Gemini Vision Analysis — {symbol}*\n```\n{pretty}\n```\n"
-                                    try:
-                                        summ = gemini_result['json'].get('summary', None)
-                                        if summ:
-                                            txt += f"\n*Summary:* {summ}"
-                                    except Exception:
-                                        pass
-                                else:
-                                    raw = gemini_result.get('raw_text', '')
-                                    txt = f"🧠 *Gemini Vision Analysis — {symbol}*\n{raw}\n"
-                                if self.bot:
-                                    await self.bot.send_message(
-                                        chat_id=TELEGRAM_CHAT_ID,
-                                        text=txt,
-                                        parse_mode='Markdown'
-                                    )
-                    except Exception as e:
-                        logger.error(f"Error during Gemini analysis for {symbol}: {e}")
-
-                # Respect Dhan recommended rate (3s) per original code
-                await asyncio.sleep(3)
-
+                
+                if not candles or len(candles) < 20:
+                    logger.warning(f"{symbol}: Insufficient candle data")
+                    continue
+                
+                # 4. Technical Analysis करतो
+                logger.info(f"📈 Calculating technical indicators...")
+                technical_data = self.tech_analyzer.calculate_indicators(candles)
+                
+                # 5. Candlestick Pattern Detection
+                logger.info(f"🕯️ Detecting candlestick patterns...")
+                patterns = self.tech_analyzer.detect_candlestick_patterns(candles)
+                
+                # 6. Chart बनवतो
+                logger.info(f"📊 Creating chart...")
+                chart_buf = self.create_candlestick_chart(candles, symbol, spot_price)
+                
+                if not chart_buf:
+                    logger.warning(f"{symbol}: Chart creation failed")
+                    continue
+                
+                # 7. Chart पाठवतो (पहिले)
+                await self.bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=chart_buf,
+                    caption=f"📊 *{symbol}* - Chart Analysis\n💰 Spot: ₹{spot_price:,.2f}"
+                )
+                logger.info(f"✅ Chart sent for {symbol}")
+                await asyncio.sleep(1)
+                
+                # 8. Technical Summary पाठवतो
+                if technical_data:
+                    tech_msg = f"📈 *TECHNICAL ANALYSIS - {symbol}*\n\n"
+                    tech_msg += f"💰 Price: ₹{spot_price:,.2f}\n"
+                    tech_msg += f"📊 Trend: *{technical_data['trend']}*\n"
+                    tech_msg += f"📉 SMA(20): ₹{technical_data['sma_20']}\n"
+                    tech_msg += f"📉 SMA(50): ₹{technical_data['sma_50']}\n"
+                    tech_msg += f"⚡ RSI(14): {technical_data['rsi']}\n"
+                    tech_msg += f"🔼 Resistance: ₹{technical_data['resistance']:,.2f}\n"
+                    tech_msg += f"🔽 Support: ₹{technical_data['support']:,.2f}\n"
+                    tech_msg += f"📊 Volume Spike: {'YES ⚠️' if technical_data['volume_spike'] else 'No'}\n"
+                    
+                    if patterns:
+                        tech_msg += f"\n🕯️ *Patterns Detected:*\n"
+                        for pattern in patterns:
+                            tech_msg += f"  {pattern}\n"
+                    
+                    await self.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=tech_msg,
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"✅ Technical analysis sent")
+                    await asyncio.sleep(1)
+                
+                # 9. Option Chain पाठवतो
+                oc_message = self.format_option_chain_message(symbol, oc_data, expiry)
+                if oc_message:
+                    await self.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=oc_message,
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"✅ Option chain sent")
+                    await asyncio.sleep(1)
+                
+                # 10. 🤖 GEMINI AI COMPREHENSIVE ANALYSIS
+                logger.info(f"🤖 Running Gemini AI comprehensive analysis...")
+                chart_buf.seek(0)  # Buffer reset
+                
+                ai_analysis = await self.gemini_analyzer.analyze_comprehensive(
+                    chart_buf, 
+                    symbol, 
+                    spot_price,
+                    oc_data,
+                    technical_data,
+                    patterns
+                )
+                
+                if ai_analysis:
+                    # AI Analysis पाठवतो
+                    ai_msg = f"🤖 *GEMINI AI ANALYSIS - {symbol}*\n"
+                    ai_msg += f"{'='*40}\n\n"
+                    ai_msg += ai_analysis
+                    
+                    await self.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=ai_msg,
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"✅ AI comprehensive analysis sent for {symbol}")
+                else:
+                    logger.warning(f"⚠️ AI analysis failed for {symbol}")
+                
+                # Final separator
+                separator_msg = f"\n{'━'*40}\n✅ *{symbol} Analysis Complete*\n{'━'*40}"
+                await self.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=separator_msg,
+                    parse_mode='Markdown'
+                )
+                
+                # Rate limiting (Dhan + Gemini)
+                logger.info(f"⏳ Cooling down 5 seconds...")
+                await asyncio.sleep(5)
+                
             except Exception as e:
-                logger.error(f"Error processing {symbol}: {e}")
-                await asyncio.sleep(3)
-
-    # --------------------
-    # Main loop
-    # --------------------
+                logger.error(f"❌ Error processing {symbol}: {e}")
+                await asyncio.sleep(5)
+    
     async def run(self):
-        logger.info("🚀 Bot started! Loading security IDs...")
-
+        """Main bot loop"""
+        logger.info("🚀 Starting Comprehensive Trading Bot...")
+        
         success = await self.load_security_ids()
         if not success:
-            logger.error("Failed to load security IDs. Exiting...")
+            logger.error("❌ Failed to load security IDs")
             return
-
+        
         await self.send_startup_message()
-
+        
         all_symbols = list(self.security_id_map.keys())
-        if not all_symbols:
-            logger.error("No symbols to track. Exiting.")
-            return
-
-        batch_size = 5
+        batch_size = 2  # Small batches for detailed analysis
         batches = [all_symbols[i:i+batch_size] for i in range(0, len(all_symbols), batch_size)]
-
-        logger.info(f"Total {len(all_symbols)} symbols in {len(batches)} batches")
-
+        
+        logger.info(f"📊 Total: {len(all_symbols)} symbols in {len(batches)} batches")
+        
         while self.running:
             try:
                 timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-                logger.info(f"\n{'='*50}")
-                logger.info(f"Starting update cycle at {timestamp}")
-                logger.info(f"{'='*50}")
-
+                logger.info(f"\n{'='*60}")
+                logger.info(f"🔄 NEW CYCLE: {timestamp}")
+                logger.info(f"{'='*60}")
+                
                 for batch_num, batch in enumerate(batches, 1):
-                    logger.info(f"\n📦 Processing Batch {batch_num}/{len(batches)}: {batch}")
+                    logger.info(f"\n📦 Batch {batch_num}/{len(batches)}: {batch}")
                     await self.send_option_chain_batch(batch)
+                    
                     if batch_num < len(batches):
-                        await asyncio.sleep(5)
-
-                logger.info("\n✅ All batches completed!")
-                logger.info("⏳ Waiting 5 minutes for next cycle...\n")
-                await asyncio.sleep(300)
-
+                        logger.info(f"⏳ Inter-batch wait: 15 seconds...")
+                        await asyncio.sleep(15)
+                
+                logger.info("\n" + "="*60)
+                logger.info("✅ CYCLE COMPLETED!")
+                logger.info("⏳ Next cycle in 5 minutes...")
+                logger.info("="*60 + "\n")
+                
+                await asyncio.sleep(300)  # 5 minutes
+                
             except KeyboardInterrupt:
-                logger.info("Bot stopped by user")
+                logger.info("🛑 Bot stopped by user")
                 self.running = False
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
+                logger.error(f"❌ Main loop error: {e}")
                 await asyncio.sleep(60)
-
+    
     async def send_startup_message(self):
+        """Startup notification"""
         try:
-            msg = "🤖 *Dhan Option Chain Bot Started!*\n\n"
-            msg += f"📊 Tracking {len(self.security_id_map)} stocks/indices\n"
-            msg += "⏱️ Updates every 5 minutes\n"
-            msg += "📈 Features:\n"
-            msg += "  • Candlestick Charts (Last candles)\n"
-            msg += "  • Option Chain: CE/PE LTP, OI, Volume\n"
-            msg += "  • Gemini Vision Analysis (if GEMINI_API_KEY set) - max 1 req/sec\n\n"
-            msg += "✅ Powered by DhanHQ API v2\n\n"
-            msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
-
-            if self.bot:
-                await self.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=msg,
-                    parse_mode='Markdown'
-                )
-            logger.info("Startup message sent (if bot configured)")
+            msg = "🤖 *COMPREHENSIVE TRADING BOT ACTIVATED!*\n"
+            msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            msg += f"📊 *Tracking:* {len(self.security_id_map)} Stocks/Indices\n"
+            msg += f"⏱️ *Update Frequency:* Every 5 minutes\n\n"
+            
+            msg += "🎯 *ANALYSIS FEATURES:*\n"
+            msg += "  ✅ Candlestick Chart (5min)\n"
+            msg += "  ✅ Technical Indicators (SMA, RSI)\n"
+            msg += "  ✅ Support/Resistance Levels\n"
+            msg += "  ✅ Candlestick Patterns\n"
+            msg += "  ✅ Volume Analysis\n"
+            msg += "  ✅ Option Chain (OI, IV, PCR)\n"
+            msg += "  ✅ AI Chart Pattern Recognition\n"
+            msg += "  ✅ Trade Setup Recommendations\n"
+            msg += "  ✅ Entry/Target/Stop Loss\n"
+            msg += "  ✅ Risk Assessment\n\n"
+            
+            msg += "⚡ *POWERED BY:*\n"
+            msg += "  • DhanHQ API v2\n"
+            msg += "  • Google Gemini 1.5 Flash AI\n"
+            msg += "  • Railway.app Hosting\n\n"
+            
+            msg += "📈 *MARKET HOURS:*\n"
+            msg += "  Monday-Friday: 9:15 AM - 3:30 PM IST\n\n"
+            
+            msg += "🔔 *Bot Status:* ACTIVE ✅\n"
+            msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=msg,
+                parse_mode='Markdown'
+            )
+            logger.info("✅ Startup message sent")
         except Exception as e:
-            logger.error(f"Error sending startup message: {e}")
+            logger.error(f"Startup message error: {e}")
+
 
 # ========================
-# BOT RUN करा
+# MAIN EXECUTION
 # ========================
 if __name__ == "__main__":
     try:
-        if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
-            logger.error("❌ Missing environment variables!")
-            logger.error("Please set: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN")
+        # Environment variables check
+        required_vars = {
+            'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN,
+            'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID,
+            'DHAN_CLIENT_ID': DHAN_CLIENT_ID,
+            'DHAN_ACCESS_TOKEN': DHAN_ACCESS_TOKEN,
+            'GEMINI_API_KEY': GEMINI_API_KEY
+        }
+        
+        missing_vars = [k for k, v in required_vars.items() if not v]
+        
+        if missing_vars:
+            logger.error("❌ MISSING ENVIRONMENT VARIABLES!")
+            logger.error(f"Missing: {', '.join(missing_vars)}")
+            logger.error("\nPlease set these in Railway.app:")
+            for var in missing_vars:
+                logger.error(f"  - {var}")
             exit(1)
-
+        
+        logger.info("✅ All environment variables present")
+        logger.info("🚀 Starting bot...")
+        
         bot = DhanOptionChainBot()
         asyncio.run(bot.run())
+        
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"💥 FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         exit(1)
