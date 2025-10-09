@@ -51,14 +51,13 @@ STOCKS_WATCHLIST = [
 ]
 
 # --- GEMINI AI ANALYZER ---
-class GeminiAnalyzer:
+class GeminiPriceActionAnalyzer:
     def __init__(self):
         self.model = genai.GenerativeModel('gemini-1.5-flash') if GEMINI_API_KEY else None
 
     def format_data_for_ai(self, symbol, oc_data, candles_df):
         spot_price = oc_data.get('spotPrice', 0)
         
-        # Format Option Chain for key levels
         oc_text = ""
         try:
             all_strikes = sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice'])
@@ -69,12 +68,10 @@ class GeminiAnalyzer:
         except (ValueError, TypeError):
              oc_text = "Option chain data is limited.\n"
         
-        # Format Candle Data
         candle_text = "Time | Open | High | Low | Close | Volume\n"
         for _, row in candles_df.tail(30).iterrows():
             candle_text += f"{row.name.strftime('%H:%M')} | {row.Open:.2f} | {row.High:.2f} | {row.Low:.2f} | {row.Close:.2f} | {row.Volume:,}\n"
 
-        # This is the new, deep analysis prompt
         return f"""You are an expert F&O trader specializing in Price Action, Chart Patterns, and Option Chain analysis. Analyze the provided data for {symbol} and create a detailed trade setup in simple Marathi.
 
 ## Market Data
@@ -100,7 +97,7 @@ class GeminiAnalyzer:
 **3. 🚨 Final Verdict & Trade Alert:**
    - **Trade Setup आहे का?** (Yes/No)
    - **Action:** (BUY CE / BUY PE)?
-   - **Strike Price:** ₹[STRIKE]
+   - **Strike:** ₹[STRIKE]
    - **Entry Price (Option Premium):** ₹[ENTRY] च्या जवळ
    - **Target:** ₹[TARGET]
    - **Stop Loss:** ₹[SL]
@@ -129,8 +126,8 @@ class DhanTradingBot:
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.headers = {'access-token': DHAN_ACCESS_TOKEN}
         self.security_id_map = {}
-        self.gemini_analyzer = GeminiAnalyzer()
-        logger.info("🚀 AI Trading Bot Initialized (Final Version)")
+        self.gemini_analyzer = GeminiPriceActionAnalyzer()
+        logger.info("🚀 AI Trading Bot Initialized (Final Fix)")
 
     async def load_security_ids(self):
         try:
@@ -145,13 +142,15 @@ class DhanTradingBot:
             # First Pass: Map Equity Symbol to its Security ID
             equity_id_map = {}
             for row in all_rows:
-                if row.get('SEM_EXM_EXCH_ID') == 'NSE' and row.get('SEM_INSTRUMENT_TYPE') == 'EQUITY':
+                # ===================== THE CRITICAL FIX IS HERE =====================
+                # The correct instrument type is 'EQ', not 'EQUITY'
+                if row.get('SEM_EXM_EXCH_ID') == 'NSE' and row.get('SEM_INSTRUMENT_TYPE') == 'EQ':
                     equity_id_map[row.get('SEM_TRADING_SYMBOL')] = int(row.get('SEM_SMST_SECURITY_ID'))
 
             # Second Pass: Find Futures using the Equity Map
             for symbol in STOCKS_WATCHLIST:
                 if symbol not in equity_id_map:
-                    logger.warning(f"Could not find equity entry for {symbol}")
+                    logger.warning(f"Could not find equity entry for {symbol} in master file.")
                     continue
                 
                 underlying_equity_id = equity_id_map[symbol]
@@ -266,6 +265,7 @@ async def main():
     server_thread = Thread(target=run_server, daemon=True); server_thread.start()
     bot = DhanTradingBot()
     
+    # Auto-retry loop
     while True:
         now_ist = datetime.now(IST)
         if 9 <= now_ist.hour < 16:
@@ -277,8 +277,8 @@ async def main():
                 await asyncio.sleep(300)
         else:
             logger.info(f"Market is closed. Current IST: {now_ist.strftime('%H:%M:%S')}. Waiting...")
-            await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"😴 Market is closed. Bot is sleeping until 9 AM IST.", parse_mode='Markdown')
-            await asyncio.sleep(3600) # Wait 1 hour if market is closed
+            await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"😴 Market is closed. Bot is sleeping...", parse_mode='Markdown')
+            await asyncio.sleep(3600)
 
     await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **AI Trading Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
     while True:
@@ -293,8 +293,8 @@ async def main():
             await asyncio.sleep(600)
         else:
             logger.info("Market is now closed. Bot will sleep until next morning.")
-            await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌙 Market closed. Bot is sleeping until 9 AM tomorrow.", parse_mode='Markdown')
-            await asyncio.sleep(3600 * 6) # Sleep for 6 hours
+            await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌙 Market closed. Bot is sleeping.", parse_mode='Markdown')
+            await asyncio.sleep(3600 * 6)
 
 if __name__ == '__main__':
     try:
