@@ -1,6 +1,6 @@
-"""
-Simplified 3-Layer AI Trading Bot
-Works WITHOUT Option Chain data - Only Chart Analysis
+# Simplified 3-Layer AI Trading Bot
+# Works WITHOUT Option Chain data - Only Chart Analysis
+# Dependencies: python-telegram-bot, requests, matplotlib, mplfinance, pandas, numpy, pytz
 """
 
 import asyncio
@@ -33,6 +33,9 @@ DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# TEST MODE: Set to True for testing outside market hours
+TEST_MODE = os.getenv("TEST_MODE", "False").upper() == "TRUE"
 
 # Dhan URLs
 DHAN_API_BASE = "https://api.dhan.co"
@@ -68,7 +71,68 @@ class SimpleChartAIBot:
         }
         self.security_map = {}
         self.trade_signals = []
-        logger.info("🤖 Simple Chart AI Bot initialized")
+        self.test_mode = TEST_MODE
+        logger.info(f"🤖 Simple Chart AI Bot initialized (TEST_MODE={self.test_mode})")
+    
+    def is_market_open(self):
+        """Check if market is open (IST)"""
+        from datetime import datetime, time
+        import pytz
+        
+        # Get IST time
+        ist = pytz.timezone('Asia/Kolkata')
+        now = datetime.now(ist)
+        
+        # Check weekend
+        if now.weekday() >= 5:  # Sat=5, Sun=6
+            return False
+        
+        # Market hours: 9:15 AM - 3:30 PM
+        market_open = time(9, 15)
+        market_close = time(15, 30)
+        current_time = now.time()
+        
+        is_open = market_open <= current_time <= market_close
+        
+        if not is_open:
+            logger.warning(f"⚠️ Market closed (Current time: {now.strftime('%H:%M IST')})")
+        
+        return is_open
+    
+    def generate_mock_data(self, symbol, base_price=1000):
+        """Generate mock data for testing"""
+        import random
+        
+        logger.info(f"🧪 Generating mock data for {symbol}")
+        
+        # Generate 100 candles
+        candles = []
+        price = base_price
+        
+        for i in range(100):
+            open_price = price
+            change = random.uniform(-2, 2)  # ±2% change
+            close_price = price + (price * change / 100)
+            high_price = max(open_price, close_price) * random.uniform(1.001, 1.01)
+            low_price = min(open_price, close_price) * random.uniform(0.99, 0.999)
+            volume = random.randint(100000, 1000000)
+            
+            timestamp = (datetime.now() - timedelta(minutes=(100-i)*5)).strftime("%Y-%m-%d %H:%M:%S")
+            
+            candles.append({
+                'timestamp': timestamp,
+                'open': round(open_price, 2),
+                'high': round(high_price, 2),
+                'low': round(low_price, 2),
+                'close': round(close_price, 2),
+                'volume': volume
+            })
+            
+            price = close_price
+        
+        spot_price = candles[-1]['close']
+        
+        return candles, spot_price
     
     async def load_securities(self):
         """Load security IDs"""
@@ -127,7 +191,7 @@ class SimpleChartAIBot:
             return False
     
     def get_spot_price(self, security_id, segment):
-        """Get current spot price"""
+        """Get current spot price with detailed logging"""
         try:
             exch_seg = "IDX_I" if segment == "IDX_I" else "NSE_EQ"
             
@@ -136,6 +200,8 @@ class SimpleChartAIBot:
                 "exchangeSegment": exch_seg
             }
             
+            logger.info(f"OHLC API Request: {payload}")
+            
             response = requests.post(
                 DHAN_OHLC_URL,
                 json=payload,
@@ -143,10 +209,24 @@ class SimpleChartAIBot:
                 timeout=10
             )
             
+            logger.info(f"OHLC Response: Status={response.status_code}")
+            logger.info(f"OHLC Body: {response.text[:300]}")
+            
             if response.status_code == 200:
                 data = response.json()
+                logger.info(f"OHLC Data: {data}")
+                
                 if data.get('data'):
-                    return data['data'].get('last_price', 0)
+                    ltp = data['data'].get('last_price', 0)
+                    if ltp > 0:
+                        logger.info(f"✅ Spot Price: {ltp}")
+                        return ltp
+                    else:
+                        logger.warning(f"⚠️ LTP is 0 or missing")
+                else:
+                    logger.warning(f"⚠️ No 'data' key in response")
+            else:
+                logger.error(f"❌ OHLC API failed: {response.status_code}")
             
             return 0
             
@@ -503,7 +583,7 @@ If NO: TRADE: NO - [reason]
         return signal
     
     async def analyze_stock(self, symbol):
-        """Complete analysis"""
+        """Complete analysis with test mode support"""
         try:
             logger.info(f"\n{'='*60}")
             logger.info(f"🔍 ANALYZING: {symbol}")
@@ -516,17 +596,37 @@ If NO: TRADE: NO - [reason]
             security_id = info['security_id']
             segment = info['segment']
             
-            # Get data
-            spot_price = self.get_spot_price(security_id, segment)
-            if spot_price == 0:
-                logger.warning(f"⚠️ {symbol}: No spot price")
-                return None
+            # Check if test mode or market closed
+            if self.test_mode or not self.is_market_open():
+                logger.info(f"🧪 Using MOCK DATA for {symbol}")
+                
+                # Mock data with realistic prices
+                mock_prices = {
+                    "NIFTY 50": 24500,
+                    "NIFTY BANK": 51000,
+                    "RELIANCE": 2850,
+                    "HDFCBANK": 1650,
+                    "ICICIBANK": 1250,
+                    "INFY": 1850,
+                    "SBIN": 820
+                }
+                
+                base_price = mock_prices.get(symbol, 1000)
+                candles, spot_price = self.generate_mock_data(symbol, base_price)
+                
+            else:
+                # Real market data
+                spot_price = self.get_spot_price(security_id, segment)
+                if spot_price == 0:
+                    logger.warning(f"⚠️ {symbol}: No spot price")
+                    return None
+                
+                candles = self.get_intraday_candles(security_id, segment)
+                if not candles or len(candles) < 50:
+                    logger.warning(f"⚠️ {symbol}: Insufficient candles")
+                    return None
             
-            candles = self.get_intraday_candles(security_id, segment)
-            if not candles or len(candles) < 50:
-                logger.warning(f"⚠️ {symbol}: Insufficient candles")
-                return None
-            
+            # Create chart
             chart_buf, chart_base64 = self.create_chart(candles, symbol, spot_price)
             if not chart_base64:
                 logger.warning(f"⚠️ {symbol}: Chart failed")
@@ -537,7 +637,7 @@ If NO: TRADE: NO - [reason]
             flash_result = await self.gemini_flash_scan(symbol, candles, spot_price)
             
             if not flash_result['approved']:
-                logger.info(f"❌ {symbol}: Flash rejected")
+                logger.info(f"❌ {symbol}: Flash rejected - {flash_result['response']}")
                 return None
             
             # Layer 2: Pro
@@ -565,7 +665,8 @@ If NO: TRADE: NO - [reason]
                 'flash_result': flash_result,
                 'pro_result': pro_result,
                 'trade_signal': trade_signal,
-                'timestamp': datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                'timestamp': datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+                'test_mode': self.test_mode or not self.is_market_open()
             }
             
         except Exception as e:
@@ -577,18 +678,26 @@ If NO: TRADE: NO - [reason]
         try:
             symbol = result['symbol']
             signal = result['trade_signal']
+            is_test = result.get('test_mode', False)
             
             # Chart
             if result.get('chart_buf'):
+                caption = f"📊 {symbol} Technical Chart"
+                if is_test:
+                    caption += " [TEST MODE - Mock Data]"
+                
                 await self.bot.send_photo(
                     chat_id=TELEGRAM_CHAT_ID,
                     photo=result['chart_buf'],
-                    caption=f"📊 {symbol} Technical Chart"
+                    caption=caption
                 )
                 await asyncio.sleep(1)
             
             # Signal message
-            msg = f"🎯 *TRADE SIGNAL: {symbol}*\n\n"
+            msg = f"🎯 *TRADE SIGNAL: {symbol}*\n"
+            if is_test:
+                msg += "🧪 *[TEST MODE - Mock Data]*\n"
+            msg += "\n"
             msg += f"💰 Spot: ₹{result['spot_price']:,.2f}\n"
             msg += f"🎲 Direction: {signal.get('direction', 'N/A')}\n\n"
             msg += f"📈 *ENTRY:* {signal.get('entry', 'N/A')}\n"
