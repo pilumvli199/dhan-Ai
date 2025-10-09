@@ -43,8 +43,7 @@ DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v1/charts/intraday"
 
 STOCKS_WATCHLIST = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "BAJFINANCE", "INFY", 
-    "TATAMOTORS", "AXISBANK", "SBIN", "ADANIENT", "KOTAKBANK",
-    "LT", "MARUTI", "NTPC", "BHARTIARTL", "POWERGRID", "M&M", "WIPRO"
+    "TATAMOTORS", "AXISBANK", "SBIN", "ADANIENT", "KOTAKBANK"
 ]
 
 # --- GEMINI AI ANALYZER ---
@@ -59,7 +58,6 @@ class GeminiPriceActionAnalyzer:
         all_strikes = sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice'])
         max_ce_oi = max(all_strikes, key=lambda x: x.get('ce_openInterest', 0))
         max_pe_oi = max(all_strikes, key=lambda x: x.get('pe_openInterest', 0))
-
         oc_text += f"Max CE OI at: {max_ce_oi['strikePrice']} ({max_ce_oi.get('ce_openInterest',0)/100000:.2f}L)\n"
         oc_text += f"Max PE OI at: {max_pe_oi['strikePrice']} ({max_pe_oi.get('pe_openInterest',0)/100000:.2f}L)\n"
         
@@ -122,6 +120,7 @@ class DhanTradingBot:
         self.headers = {'access-token': DHAN_ACCESS_TOKEN}
         self.security_id_map = {}
         self.gemini_analyzer = GeminiPriceActionAnalyzer()
+        self.latest_csv_content = None # To store CSV data
         logger.info("🚀 Price Action AI Bot Initialized")
 
     async def load_security_ids(self):
@@ -130,8 +129,12 @@ class DhanTradingBot:
             response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
             response.raise_for_status()
             
-            all_rows = list(csv.DictReader(io.StringIO(response.text)))
+            # Store the content for debugging
+            self.latest_csv_content = response.text
+            
+            all_rows = list(csv.DictReader(io.StringIO(self.latest_csv_content)))
             today = datetime.now()
+            self.security_id_map.clear() # Clear previous data
 
             for symbol in STOCKS_WATCHLIST:
                 futures = []
@@ -155,14 +158,14 @@ class DhanTradingBot:
             return len(self.security_id_map) > 0
         except Exception as e:
             logger.error(f"CRITICAL: Error loading security IDs: {e}", exc_info=True)
+            self.latest_csv_content = f"Failed to download file: {e}"
             return False
 
     def get_api_data(self, url, payload):
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=15)
             response.raise_for_status()
-            data = response.json()
-            return data.get('data')
+            return response.json().get('data')
         except Exception as e:
             logger.error(f"API call to {url} failed: {e}")
             return None
@@ -173,17 +176,12 @@ class DhanTradingBot:
             df_chart['SMA20'] = df_chart['Close'].rolling(window=20).mean()
             df_chart['SMA50'] = df_chart['Close'].rolling(window=50).mean()
 
-            mc = mpf.make_marketcolors(up='#10FF70', down='#FF3333', inherit=True, wick='inherit', edge='inherit')
-            s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds', rc={'font.size': 12, 'axes.labelcolor': 'white', 'xtick.color': 'white', 'ytick.color': 'white'})
-            apds = [
-                mpf.make_addplot(df_chart['SMA20'], color='#FFD700', width=1.2),
-                mpf.make_addplot(df_chart['SMA50'], color='#00BFFF', width=1.2),
-            ]
-            fig, axes = mpf.plot(df_chart.tail(120), type='candle', style=s, volume=True, addplot=apds,
-                                 title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}', figsize=(16, 8), returnfig=True,
-                                 panel_ratios=(4, 1), volume_panel=1)
+            mc = mpf.make_marketcolors(up='#10FF70', down='#FF3333', inherit=True)
+            s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds', rc={'font.size': 12})
+            apds = [mpf.make_addplot(df_chart['SMA20'], color='#FFD700'), mpf.make_addplot(df_chart['SMA50'], color='#00BFFF')]
+            fig, axes = mpf.plot(df_chart.tail(120), type='candle', style=s, volume=True, addplot=apds, title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}', figsize=(16, 8), returnfig=True)
             axes[0].legend(['SMA20', 'SMA50'])
-            buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=120, bbox_inches='tight'); buf.seek(0)
+            buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=120); buf.seek(0)
             return buf
         except Exception as e:
             logger.error(f"Error creating chart for {symbol}: {e}")
@@ -193,30 +191,22 @@ class DhanTradingBot:
         try:
             info = self.security_id_map[symbol]
             logger.info(f"--- Processing {symbol} ---")
-
             oc_data = self.get_api_data(DHAN_OPTION_CHAIN_URL, {'securityId': str(info['fno_id']), 'exchangeSegment': 'NSE_FNO'})
             if not oc_data: return
-
             hist_payload = {"securityId": str(info['equity_id']), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "fromDate": (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"), "toDate": datetime.now().strftime("%Y-%m-%d"), "interval": "FIVE_MINUTE"}
             hist_data = self.get_api_data(DHAN_INTRADAY_URL, hist_payload)
             if not hist_data: return
-
             candles_df = pd.DataFrame({'Date': pd.to_datetime(hist_data['start_Time'], unit='s'), 'Open': hist_data['open'], 'High': hist_data['high'], 'Low': hist_data['low'], 'Close': hist_data['close'], 'Volume': hist_data['volume']})
             if len(candles_df) < 50: return
-            
             spot_price = oc_data.get('spotPrice', 0)
             chart_buf = self.create_chart(candles_df, symbol, spot_price)
             if not chart_buf: return
-
             ai_analysis_text = await self.gemini_analyzer.analyze(symbol, chart_buf, oc_data, candles_df)
-
             alert_header = f"🚨 **TRADE ALERT: {symbol}** 🚨" if "BUY CE" in ai_analysis_text or "BUY PE" in ai_analysis_text else f"📉 *Analysis for {symbol}*"
             caption = f"{alert_header}\n\n{ai_analysis_text}"
-            
             chart_buf.seek(0)
             await self.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=InputFile(chart_buf, filename=f"{symbol}.png"), caption=caption, parse_mode='Markdown')
             logger.info(f"✅ Analysis sent for {symbol}")
-
         except Exception as e:
             logger.error(f"FATAL error processing {symbol}: {e}", exc_info=True)
 
@@ -227,7 +217,7 @@ class KeepAliveHandler(BaseHTTPRequestHandler):
 def run_server():
     port = int(os.environ.get("PORT", 8080))
     try:
-        httpd = HTTPServer(('', port), KeepAliveHandler); logger.info(f"Starting keep-alive server on port {port}..."); httpd.serve_forever()
+        httpd = HTTPServer(('', port), KeepAliveHandler); logger.info(f"Starting server on port {port}..."); httpd.serve_forever()
     except Exception: pass
 
 async def main():
@@ -237,16 +227,25 @@ async def main():
     server_thread = Thread(target=run_server, daemon=True); server_thread.start()
     bot = DhanTradingBot()
     
-    # --- AUTO-RETRY LOOP FOR PRE-MARKET START ---
     while True:
         if await bot.load_security_ids():
             logger.info("Successfully loaded F&O securities. Starting main loop.")
+            await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **AI Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
             break
-        logger.warning("Failed to load F&O securities (market may be closed). Retrying in 5 minutes...")
-        await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⏳ **Market Closed?** Failed to load F&O data. Will retry in 5 minutes...", parse_mode='Markdown')
-        await asyncio.sleep(300) # Wait 5 minutes and retry
+        else:
+            logger.warning("Failed to load F&O securities. Sending debug file to Telegram...")
+            await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚠️ **Error!** Could not find F&O data. Here is the master file I am using for debugging. The column names or values might be incorrect.", parse_mode='Markdown')
+            
+            # Send the CSV file for debugging
+            if bot.latest_csv_content:
+                csv_buffer = io.BytesIO(bot.latest_csv_content.encode('utf-8'))
+                csv_buffer.name = 'api-scrip-master.csv'
+                await bot.bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=csv_buffer)
 
-    await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **Price Action AI Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
+            logger.info("Waiting for 10 minutes before retrying...")
+            await asyncio.sleep(600)
+
+    # This part runs only after successful loading
     while True:
         logger.info("============== NEW SCAN CYCLE ==============")
         for symbol in bot.security_id_map.keys():
