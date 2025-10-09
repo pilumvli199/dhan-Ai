@@ -93,9 +93,10 @@ class GeminiAnalyzer:
     def analyze_chart(self, chart_buffer, symbol, candle_data, option_data):
         """Chart + data analysis करतो using Gemini Vision"""
         try:
-            # Chart ला base64 मध्ये convert करतो
+            # Chart ला base64 मध्ये convert करतो (buffer position reset करतो)
             chart_buffer.seek(0)
             image_bytes = chart_buffer.read()
+            chart_buffer.seek(0)  # IMPORTANT: Reset position for future use
             image_base64 = base64.b64encode(image_bytes).decode('utf-8')
             
             # Option chain summary तयार करतो
@@ -731,7 +732,7 @@ class DhanOptionChainBot:
                     logger.info(f"Creating candlestick chart for {symbol}...")
                     chart_buf = self.create_candlestick_chart(candles, symbol, spot_price)
                 
-                # 🤖 AI Analysis (Gemini Flash)
+                # 🤖 AI Analysis (Gemini Flash) - पहिले करतो before chart send
                 ai_analysis = None
                 if self.gemini:
                     logger.info(f"🤖 Getting Gemini AI analysis for {symbol}...")
@@ -744,6 +745,7 @@ class DhanOptionChainBot:
                             candles, 
                             oc_data
                         )
+                        # Buffer position अगोदरच reset झाली आहे analyze_chart मध्ये
                     # Fallback: फक्त option chain analysis
                     elif not chart_buf:
                         ai_analysis = self.gemini.analyze_option_chain_only(
@@ -751,8 +753,9 @@ class DhanOptionChainBot:
                             oc_data
                         )
                 
-                # 1️⃣ Chart पाठवतो
+                # 1️⃣ Chart पाठवतो (buffer already reset in analyze_chart)
                 if chart_buf:
+                    chart_buf.seek(0)  # Extra safety - ensure buffer at start
                     await self.bot.send_photo(
                         chat_id=TELEGRAM_CHAT_ID,
                         photo=chart_buf,
