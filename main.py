@@ -1,65 +1,353 @@
-# Simplified 3-Layer AI Trading Bot
-# Works WITHOUT Option Chain data - Only Chart Analysis
-# Dependencies: python-telegram-bot, requests, matplotlib, mplfinance, pandas, numpy, pytz
-"""
-
 import asyncio
 import os
 from telegram import Bot
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 import csv
 import io
+import base64
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import mplfinance as mpf
 import pandas as pd
-import base64
 import json
 
-# Logging
+# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
+# ========================
+# CONFIGURATION
+# ========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # New: Gemini API Key
 
-# TEST MODE: Set to True for testing outside market hours
-TEST_MODE = os.getenv("TEST_MODE", "False").upper() == "TRUE"
-
-# Dhan URLs
+# Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
-DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
 DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
+DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
+DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
+DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+DHAN_HISTORICAL_URL = f"{DHAN_API_BASE}/v2/charts/historical"
+DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
 
-# AI URLs
-GEMINI_FLASH_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-GEMINI_PRO_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
-OPENAI_GPT4_URL = "https://api.openai.com/v1/chat/completions"
+# Gemini API URL
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent"
 
-# Stocks to track (High liquidity)
-STOCKS = {
+# Stock/Index List - Symbol mapping
+STOCKS_INDICES = {
+    # Indices
     "NIFTY 50": {"symbol": "NIFTY 50", "segment": "IDX_I"},
     "NIFTY BANK": {"symbol": "NIFTY BANK", "segment": "IDX_I"},
+    "SENSEX": {"symbol": "SENSEX", "segment": "IDX_I"},
+    
+    # Stocks
     "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ"},
     "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ"},
     "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ"},
+    "BAJFINANCE": {"symbol": "BAJFINANCE", "segment": "NSE_EQ"},
     "INFY": {"symbol": "INFY", "segment": "NSE_EQ"},
+    "TATAMOTORS": {"symbol": "TATAMOTORS", "segment": "NSE_EQ"},
+    "AXISBANK": {"symbol": "AXISBANK", "segment": "NSE_EQ"},
     "SBIN": {"symbol": "SBIN", "segment": "NSE_EQ"},
+    "LTIM": {"symbol": "LTIM", "segment": "NSE_EQ"},
+    "ADANIENT": {"symbol": "ADANIENT", "segment": "NSE_EQ"},
+    "KOTAKBANK": {"symbol": "KOTAKBANK", "segment": "NSE_EQ"},
+    "LT": {"symbol": "LT", "segment": "NSE_EQ"},
+    "MARUTI": {"symbol": "MARUTI", "segment": "NSE_EQ"},
+    "TECHM": {"symbol": "TECHM", "segment": "NSE_EQ"},
+    "LICI": {"symbol": "LICI", "segment": "NSE_EQ"},
+    "HINDUNILVR": {"symbol": "HINDUNILVR", "segment": "NSE_EQ"},
+    "NTPC": {"symbol": "NTPC", "segment": "NSE_EQ"},
+    "BHARTIARTL": {"symbol": "BHARTIARTL", "segment": "NSE_EQ"},
+    "POWERGRID": {"symbol": "POWERGRID", "segment": "NSE_EQ"},
+    "ONGC": {"symbol": "ONGC", "segment": "NSE_EQ"},
+    "PERSISTENT": {"symbol": "PERSISTENT", "segment": "NSE_EQ"},
+    "DRREDDY": {"symbol": "DRREDDY", "segment": "NSE_EQ"},
+    "M&M": {"symbol": "M&M", "segment": "NSE_EQ"},
+    "WIPRO": {"symbol": "WIPRO", "segment": "NSE_EQ"},
+    "DMART": {"symbol": "DMART", "segment": "NSE_EQ"},
+    "TRENT": {"symbol": "TRENT", "segment": "NSE_EQ"},
 }
 
-class SimpleChartAIBot:
+# ========================
+# GEMINI AI INTEGRATION
+# ========================
+
+class GeminiAnalyzer:
+    """Gemini Flash Model साठी analyzer class"""
+    
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.api_url = f"{GEMINI_API_URL}?key={api_key}"
+    
+    def analyze_chart(self, chart_buffer, symbol, candle_data, option_data):
+        """Chart + data analysis करतो using Gemini Vision"""
+        try:
+            # Chart ला base64 मध्ये convert करतो
+            chart_buffer.seek(0)
+            image_bytes = chart_buffer.read()
+            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+            
+            # Option chain summary तयार करतो
+            spot_price = option_data.get('last_price', 0)
+            oc_data = option_data.get('oc', {})
+            
+            # ATM strike शोधतो
+            strikes = sorted([float(s) for s in oc_data.keys()])
+            atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
+            atm_data = oc_data.get(f"{atm_strike:.6f}", {})
+            
+            # CE/PE data
+            ce = atm_data.get('ce', {})
+            pe = atm_data.get('pe', {})
+            
+            # Prompt तयार करतो
+            prompt = f"""तुम्ही एक expert options trader आणि technical analyst आहात. खालील data analyze करा:
+
+**Symbol:** {symbol}
+**Spot Price:** ₹{spot_price:,.2f}
+**ATM Strike:** ₹{atm_strike:,.0f}
+**Candles:** {len(candle_data)} (5-min timeframe)
+
+**Option Chain Data (ATM):**
+- CE LTP: ₹{ce.get('last_price', 0):.2f} | OI: {ce.get('oi', 0):,.0f} | Vol: {ce.get('volume', 0):,.0f}
+- PE LTP: ₹{pe.get('last_price', 0):.2f} | OI: {pe.get('oi', 0):,.0f} | Vol: {pe.get('volume', 0):,.0f}
+- CE IV: {ce.get('implied_volatility', 0):.1f}% | PE IV: {pe.get('implied_volatility', 0):.1f}%
+
+**Chart:** Candlestick chart पाहून pattern identify करा.
+
+**कृपया खालील analysis द्या (Marathi मध्ये, max 15 lines):**
+
+1️⃣ **Technical Pattern:** Chart मध्ये कोणता pattern आहे? (Support/Resistance, Trend, Breakout etc.)
+
+2️⃣ **Option Chain Signal:** 
+   - CE/PE OI ratio काय सांगतो? (Bullish/Bearish)
+   - Volume किती active आहे?
+   - IV च्या basis वर sentiment काय आहे?
+
+3️⃣ **PCR Analysis:** Put-Call ratio आणि त्याचे interpretation
+
+4️⃣ **Trade Recommendation:** 
+   - Intraday साठी strategy (CE/PE buy/sell?)
+   - Entry/Exit levels
+   - Risk management
+
+5️⃣ **Key Levels:** Important support आणि resistance levels
+
+**Format:** Bullet points मध्ये, crisp आणि actionable insights द्या."""
+
+            # Gemini API call
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt},
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/png",
+                                    "data": image_base64
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 1024,
+                    "topP": 0.8,
+                    "topK": 40
+                }
+            }
+            
+            response = requests.post(
+                self.api_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                # Response extract करतो
+                if 'candidates' in result and len(result['candidates']) > 0:
+                    candidate = result['candidates'][0]
+                    if 'content' in candidate and 'parts' in candidate['content']:
+                        analysis_text = candidate['content']['parts'][0].get('text', '')
+                        
+                        logger.info(f"✅ Gemini analysis completed for {symbol}")
+                        return analysis_text
+                
+                logger.warning(f"⚠️ Unexpected Gemini response format for {symbol}")
+                return None
+            else:
+                logger.error(f"❌ Gemini API error for {symbol}: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error in Gemini analysis for {symbol}: {e}")
+            return None
+    
+    def analyze_option_chain_only(self, symbol, option_data):
+        """फक्त option chain data analysis (without chart)"""
+        try:
+            spot_price = option_data.get('last_price', 0)
+            oc_data = option_data.get('oc', {})
+            
+            if not oc_data:
+                return None
+            
+            # ATM च्या आजूबाजूचे strikes analyze करतो
+            strikes = sorted([float(s) for s in oc_data.keys()])
+            atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
+            atm_idx = strikes.index(atm_strike)
+            
+            # ATM ± 3 strikes घेतो
+            start_idx = max(0, atm_idx - 3)
+            end_idx = min(len(strikes), atm_idx + 4)
+            relevant_strikes = strikes[start_idx:end_idx]
+            
+            # Data summarize करतो
+            chain_summary = []
+            total_ce_oi = 0
+            total_pe_oi = 0
+            total_ce_vol = 0
+            total_pe_vol = 0
+            
+            for strike in relevant_strikes:
+                strike_key = f"{strike:.6f}"
+                strike_data = oc_data.get(strike_key, {})
+                
+                ce = strike_data.get('ce', {})
+                pe = strike_data.get('pe', {})
+                
+                ce_oi = ce.get('oi', 0)
+                pe_oi = pe.get('oi', 0)
+                ce_vol = ce.get('volume', 0)
+                pe_vol = pe.get('volume', 0)
+                
+                total_ce_oi += ce_oi
+                total_pe_oi += pe_oi
+                total_ce_vol += ce_vol
+                total_pe_vol += pe_vol
+                
+                chain_summary.append({
+                    'strike': strike,
+                    'ce_ltp': ce.get('last_price', 0),
+                    'ce_oi': ce_oi,
+                    'ce_vol': ce_vol,
+                    'ce_iv': ce.get('implied_volatility', 0),
+                    'pe_ltp': pe.get('last_price', 0),
+                    'pe_oi': pe_oi,
+                    'pe_vol': pe_vol,
+                    'pe_iv': pe.get('implied_volatility', 0)
+                })
+            
+            # PCR calculate करतो
+            pcr_oi = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+            pcr_vol = total_pe_vol / total_ce_vol if total_ce_vol > 0 else 0
+            
+            # ATM data
+            atm_data = oc_data.get(f"{atm_strike:.6f}", {})
+            ce_atm = atm_data.get('ce', {})
+            pe_atm = atm_data.get('pe', {})
+            
+            # Prompt
+            prompt = f"""तुम्ही expert options trader आहात. खालील {symbol} च्या option chain data चे analysis करा:
+
+**Market Data:**
+- Spot Price: ₹{spot_price:,.2f}
+- ATM Strike: ₹{atm_strike:,.0f}
+
+**Aggregated Metrics:**
+- Total CE OI: {total_ce_oi:,.0f} | Total PE OI: {total_pe_oi:,.0f}
+- PCR (OI): {pcr_oi:.2f} | PCR (Volume): {pcr_vol:.2f}
+- Total CE Vol: {total_ce_vol:,.0f} | Total PE Vol: {total_pe_vol:,.0f}
+
+**ATM Strike Data:**
+- CE: LTP ₹{ce_atm.get('last_price', 0):.2f} | OI {ce_atm.get('oi', 0):,.0f} | IV {ce_atm.get('implied_volatility', 0):.1f}%
+- PE: LTP ₹{pe_atm.get('last_price', 0):.2f} | OI {pe_atm.get('oi', 0):,.0f} | IV {pe_atm.get('implied_volatility', 0):.1f}%
+
+**Strike-wise Data:**
+{json.dumps(chain_summary, indent=2)}
+
+**कृपया खालील analysis द्या (Marathi, max 12 lines):**
+
+1️⃣ **Market Sentiment:** PCR आणि OI distribution वरून overall sentiment (Bullish/Bearish/Neutral)
+
+2️⃣ **Key Observations:**
+   - कोणत्या strike वर maximum OI buildup?
+   - Volume activity कुठे जास्त?
+   - IV skew काय indicate करतो?
+
+3️⃣ **Intraday Strategy:** आजच्या session साठी trade ideas (CE/PE positions)
+
+4️⃣ **Support/Resistance:** Option data वरून key levels identify करा
+
+5️⃣ **Risk Alert:** कोणते levels avoid करायचे किंवा caution घ्यायची?
+
+**Format:** Short, actionable Marathi मध्ये."""
+
+            # Gemini API call (text-only)
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt}
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 800,
+                    "topP": 0.8,
+                    "topK": 40
+                }
+            }
+            
+            response = requests.post(
+                self.api_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                if 'candidates' in result and len(result['candidates']) > 0:
+                    candidate = result['candidates'][0]
+                    if 'content' in candidate and 'parts' in candidate['content']:
+                        analysis_text = candidate['content']['parts'][0].get('text', '')
+                        
+                        logger.info(f"✅ Gemini option chain analysis for {symbol}")
+                        return analysis_text
+                
+                return None
+            else:
+                logger.error(f"❌ Gemini API error: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error in option chain analysis: {e}")
+            return None
+
+
+# ========================
+# BOT CODE (Enhanced)
+# ========================
+
+class DhanOptionChainBot:
     def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
@@ -69,176 +357,86 @@ class SimpleChartAIBot:
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         }
-        self.security_map = {}
-        self.trade_signals = []
-        self.test_mode = TEST_MODE
-        logger.info(f"🤖 Simple Chart AI Bot initialized (TEST_MODE={self.test_mode})")
+        self.security_id_map = {}
+        
+        # Gemini Analyzer initialize करतो
+        if GEMINI_API_KEY:
+            self.gemini = GeminiAnalyzer(GEMINI_API_KEY)
+            logger.info("✅ Gemini AI Analyzer initialized")
+        else:
+            self.gemini = None
+            logger.warning("⚠️ GEMINI_API_KEY not found - AI analysis disabled")
+        
+        logger.info("Bot initialized successfully")
     
-    def is_market_open(self):
-        """Check if market is open (IST)"""
-        from datetime import datetime, time
-        import pytz
-        
-        # Get IST time
-        ist = pytz.timezone('Asia/Kolkata')
-        now = datetime.now(ist)
-        
-        # Check weekend
-        if now.weekday() >= 5:  # Sat=5, Sun=6
-            return False
-        
-        # Market hours: 9:15 AM - 3:30 PM
-        market_open = time(9, 15)
-        market_close = time(15, 30)
-        current_time = now.time()
-        
-        is_open = market_open <= current_time <= market_close
-        
-        if not is_open:
-            logger.warning(f"⚠️ Market closed (Current time: {now.strftime('%H:%M IST')})")
-        
-        return is_open
-    
-    def generate_mock_data(self, symbol, base_price=1000):
-        """Generate mock data for testing"""
-        import random
-        
-        logger.info(f"🧪 Generating mock data for {symbol}")
-        
-        # Generate 100 candles
-        candles = []
-        price = base_price
-        
-        for i in range(100):
-            open_price = price
-            change = random.uniform(-2, 2)  # ±2% change
-            close_price = price + (price * change / 100)
-            high_price = max(open_price, close_price) * random.uniform(1.001, 1.01)
-            low_price = min(open_price, close_price) * random.uniform(0.99, 0.999)
-            volume = random.randint(100000, 1000000)
-            
-            timestamp = (datetime.now() - timedelta(minutes=(100-i)*5)).strftime("%Y-%m-%d %H:%M:%S")
-            
-            candles.append({
-                'timestamp': timestamp,
-                'open': round(open_price, 2),
-                'high': round(high_price, 2),
-                'low': round(low_price, 2),
-                'close': round(close_price, 2),
-                'volume': volume
-            })
-            
-            price = close_price
-        
-        spot_price = candles[-1]['close']
-        
-        return candles, spot_price
-    
-    async def load_securities(self):
-        """Load security IDs"""
+    async def load_security_ids(self):
+        """Dhan मधून security IDs load करतो (without pandas)"""
         try:
-            logger.info("📥 Loading security IDs...")
+            logger.info("Loading security IDs from Dhan...")
             response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
             
-            if response.status_code != 200:
-                return False
-            
-            csv_data = response.text.split('\n')
-            reader = csv.DictReader(csv_data)
-            
-            for symbol, info in STOCKS.items():
-                segment = info['segment']
-                symbol_name = info['symbol']
-                
-                for row in reader:
-                    try:
-                        if segment == "IDX_I":
-                            if (row.get('SEM_SEGMENT') == 'I' and 
-                                row.get('SEM_TRADING_SYMBOL') == symbol_name):
-                                sec_id = row.get('SEM_SMST_SECURITY_ID')
-                                if sec_id:
-                                    self.security_map[symbol] = {
-                                        'security_id': int(sec_id),
-                                        'segment': segment,
-                                        'trading_symbol': symbol_name
-                                    }
-                                    logger.info(f"✅ {symbol}: ID={sec_id}")
-                                    break
-                        else:
-                            if (row.get('SEM_SEGMENT') == 'E' and 
-                                row.get('SEM_TRADING_SYMBOL') == symbol_name and
-                                row.get('SEM_EXM_EXCH_ID') == 'NSE'):
-                                sec_id = row.get('SEM_SMST_SECURITY_ID')
-                                if sec_id:
-                                    self.security_map[symbol] = {
-                                        'security_id': int(sec_id),
-                                        'segment': segment,
-                                        'trading_symbol': symbol_name
-                                    }
-                                    logger.info(f"✅ {symbol}: ID={sec_id}")
-                                    break
-                    except:
-                        continue
-                
+            if response.status_code == 200:
                 csv_data = response.text.split('\n')
                 reader = csv.DictReader(csv_data)
-            
-            logger.info(f"✅ Loaded {len(self.security_map)} securities")
-            return True
-            
+                
+                for symbol, info in STOCKS_INDICES.items():
+                    segment = info['segment']
+                    symbol_name = info['symbol']
+                    
+                    for row in reader:
+                        try:
+                            if segment == "IDX_I":
+                                if (row.get('SEM_SEGMENT') == 'I' and 
+                                    row.get('SEM_TRADING_SYMBOL') == symbol_name):
+                                    sec_id = row.get('SEM_SMST_SECURITY_ID')
+                                    if sec_id:
+                                        self.security_id_map[symbol] = {
+                                            'security_id': int(sec_id),
+                                            'segment': segment,
+                                            'trading_symbol': symbol_name
+                                        }
+                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
+                                        break
+                            else:
+                                if (row.get('SEM_SEGMENT') == 'E' and 
+                                    row.get('SEM_TRADING_SYMBOL') == symbol_name and
+                                    row.get('SEM_EXM_EXCH_ID') == 'NSE'):
+                                    sec_id = row.get('SEM_SMST_SECURITY_ID')
+                                    if sec_id:
+                                        self.security_id_map[symbol] = {
+                                            'security_id': int(sec_id),
+                                            'segment': segment,
+                                            'trading_symbol': symbol_name
+                                        }
+                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
+                                        break
+                        except Exception as e:
+                            continue
+                    
+                    csv_data_reset = response.text.split('\n')
+                    reader = csv.DictReader(csv_data_reset)
+                
+                logger.info(f"Total {len(self.security_id_map)} securities loaded")
+                return True
+            else:
+                logger.error(f"Failed to load instruments: {response.status_code}")
+                return False
+                
         except Exception as e:
-            logger.error(f"❌ Error loading securities: {e}")
+            logger.error(f"Error loading security IDs: {e}")
             return False
     
-    def get_spot_price(self, security_id, segment):
-        """Get current spot price with detailed logging"""
+    def get_historical_data(self, security_id, segment, symbol):
+        """Last 5 days चे सर्व 5-minute candles घेतो"""
         try:
-            exch_seg = "IDX_I" if segment == "IDX_I" else "NSE_EQ"
+            from datetime import datetime, timedelta
             
-            payload = {
-                "securityId": str(security_id),
-                "exchangeSegment": exch_seg
-            }
-            
-            logger.info(f"OHLC API Request: {payload}")
-            
-            response = requests.post(
-                DHAN_OHLC_URL,
-                json=payload,
-                headers=self.headers,
-                timeout=10
-            )
-            
-            logger.info(f"OHLC Response: Status={response.status_code}")
-            logger.info(f"OHLC Body: {response.text[:300]}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                logger.info(f"OHLC Data: {data}")
-                
-                if data.get('data'):
-                    ltp = data['data'].get('last_price', 0)
-                    if ltp > 0:
-                        logger.info(f"✅ Spot Price: {ltp}")
-                        return ltp
-                    else:
-                        logger.warning(f"⚠️ LTP is 0 or missing")
-                else:
-                    logger.warning(f"⚠️ No 'data' key in response")
+            if segment == "IDX_I":
+                exch_seg = "IDX_I"
+                instrument = "INDEX"
             else:
-                logger.error(f"❌ OHLC API failed: {response.status_code}")
-            
-            return 0
-            
-        except Exception as e:
-            logger.error(f"❌ Error getting spot price: {e}")
-            return 0
-    
-    def get_intraday_candles(self, security_id, segment):
-        """Get 5-min candles"""
-        try:
-            exch_seg = "IDX_I" if segment == "IDX_I" else "NSE_EQ"
-            instrument = "INDEX" if segment == "IDX_I" else "EQUITY"
+                exch_seg = "NSE_EQ"
+                instrument = "EQUITY"
             
             to_date = datetime.now()
             from_date = to_date - timedelta(days=7)
@@ -262,47 +460,59 @@ class SimpleChartAIBot:
             if response.status_code == 200:
                 data = response.json()
                 
-                if 'open' in data:
+                if 'open' in data and 'high' in data and 'low' in data and 'close' in data:
+                    opens = data.get('open', [])
+                    highs = data.get('high', [])
+                    lows = data.get('low', [])
+                    closes = data.get('close', [])
+                    volumes = data.get('volume', [])
+                    timestamps = data.get('start_Time', [])
+                    
                     candles = []
-                    for i in range(len(data['open'])):
+                    for i in range(len(opens)):
                         candles.append({
-                            'timestamp': data['start_Time'][i] if i < len(data['start_Time']) else '',
-                            'open': data['open'][i],
-                            'high': data['high'][i],
-                            'low': data['low'][i],
-                            'close': data['close'][i],
-                            'volume': data['volume'][i]
+                            'timestamp': timestamps[i] if i < len(timestamps) else '',
+                            'open': opens[i] if i < len(opens) else 0,
+                            'high': highs[i] if i < len(highs) else 0,
+                            'low': lows[i] if i < len(lows) else 0,
+                            'close': closes[i] if i < len(closes) else 0,
+                            'volume': volumes[i] if i < len(volumes) else 0
                         })
                     
-                    logger.info(f"📊 Got {len(candles)} candles")
+                    logger.info(f"{symbol}: Returning {len(candles)} candles")
                     return candles
+                else:
+                    logger.warning(f"{symbol}: Invalid response format")
+                    return None
             
+            logger.warning(f"{symbol}: Historical data नाही मिळाला")
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error getting candles: {e}")
+            logger.error(f"Error getting historical data for {symbol}: {e}")
             return None
     
-    def create_chart(self, candles, symbol, spot_price):
-        """Create chart"""
+    def create_candlestick_chart(self, candles, symbol, spot_price):
+        """Candlestick chart तयार करतो"""
         try:
             df_data = []
             for candle in candles:
-                timestamp = candle.get('timestamp', '')
+                timestamp = candle.get('timestamp', candle.get('start_Time', ''))
                 df_data.append({
                     'Date': pd.to_datetime(timestamp) if timestamp else pd.Timestamp.now(),
-                    'Open': float(candle['open']),
-                    'High': float(candle['high']),
-                    'Low': float(candle['low']),
-                    'Close': float(candle['close']),
-                    'Volume': int(float(candle['volume']))
+                    'Open': float(candle.get('open', 0)),
+                    'High': float(candle.get('high', 0)),
+                    'Low': float(candle.get('low', 0)),
+                    'Close': float(candle.get('close', 0)),
+                    'Volume': int(float(candle.get('volume', 0)))
                 })
             
             df = pd.DataFrame(df_data)
             df.set_index('Date', inplace=True)
             
             if len(df) < 2:
-                return None, None
+                logger.warning(f"{symbol}: Not enough candles for chart")
+                return None
             
             mc = mpf.make_marketcolors(
                 up='#26a69a',
@@ -317,7 +527,9 @@ class SimpleChartAIBot:
                 gridstyle='-',
                 gridcolor='#333333',
                 facecolor='#1e1e1e',
-                figcolor='#1e1e1e'
+                figcolor='#1e1e1e',
+                gridaxis='both',
+                y_on_right=False
             )
             
             fig, axes = mpf.plot(
@@ -325,506 +537,367 @@ class SimpleChartAIBot:
                 type='candle',
                 style=s,
                 volume=True,
-                title=f'\n{symbol} - Spot: ₹{spot_price:,.2f}',
+                title=f'\n{symbol} - Last {len(candles)} Candles | Spot: ₹{spot_price:,.2f}',
+                ylabel='Price (₹)',
+                ylabel_lower='Volume',
                 figsize=(12, 8),
-                returnfig=True
+                returnfig=True,
+                tight_layout=True
             )
             
-            # For Telegram
+            axes[0].set_title(
+                f'{symbol} - Last {len(candles)} Candles | Spot: ₹{spot_price:,.2f}',
+                color='white',
+                fontsize=14,
+                fontweight='bold',
+                pad=20
+            )
+            
+            for ax in axes:
+                ax.tick_params(colors='white', which='both')
+                ax.spines['bottom'].set_color('white')
+                ax.spines['top'].set_color('white')
+                ax.spines['left'].set_color('white')
+                ax.spines['right'].set_color('white')
+                ax.xaxis.label.set_color('white')
+                ax.yaxis.label.set_color('white')
+            
             buf = io.BytesIO()
             fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1e1e1e')
             buf.seek(0)
-            
-            # For AI (base64)
-            buf_copy = io.BytesIO()
-            fig.savefig(buf_copy, format='png', dpi=100, bbox_inches='tight', facecolor='#1e1e1e')
-            buf_copy.seek(0)
-            base64_img = base64.b64encode(buf_copy.read()).decode('utf-8')
-            
             plt.close(fig)
             
-            return buf, base64_img
+            return buf
             
         except Exception as e:
-            logger.error(f"❌ Chart error: {e}")
-            return None, None
-    
-    def prepare_candle_text(self, candles):
-        """Convert candles to text"""
-        text = "Timestamp | Open | High | Low | Close | Volume\n"
-        text += "-" * 70 + "\n"
-        
-        for candle in candles[-30:]:  # Last 30
-            time = candle['timestamp'][-8:] if candle['timestamp'] else ''
-            text += f"{time} | {candle['open']:.2f} | {candle['high']:.2f} | {candle['low']:.2f} | {candle['close']:.2f} | {candle['volume']}\n"
-        
-        return text
-    
-    async def gemini_flash_scan(self, symbol, candles, spot_price):
-        """Layer 1: Quick scan"""
-        try:
-            logger.info(f"⚡ Gemini Flash scanning {symbol}...")
-            
-            candle_text = self.prepare_candle_text(candles)
-            
-            prompt = f"""Analyze {symbol} chart for F&O trading opportunity.
-
-**Spot Price:** ₹{spot_price:,.2f}
-
-**Last 30 Candles (5-min):**
-{candle_text}
-
-**Task:** Quick scan - Is there a trading opportunity?
-Look for: Trend, momentum, volume surge, breakout/breakdown
-
-Response Format: YES/NO - [1 line reason]
-
-Example: "YES - Strong bullish breakout with volume surge"
-"""
-            
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.4,
-                    "maxOutputTokens": 100
-                }
-            }
-            
-            response = requests.post(
-                f"{GEMINI_FLASH_URL}?key={GEMINI_API_KEY}",
-                headers={'Content-Type': 'application/json'},
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                ai_response = result['candidates'][0]['content']['parts'][0]['text'].strip()
-                logger.info(f"⚡ Flash: {ai_response}")
-                
-                approved = ai_response.upper().startswith('YES')
-                return {'approved': approved, 'response': ai_response}
-            
-            return {'approved': False, 'response': 'API Error'}
-            
-        except Exception as e:
-            logger.error(f"❌ Flash error: {e}")
-            return {'approved': False, 'response': str(e)}
-    
-    async def gemini_pro_strategy(self, symbol, candles, spot_price, flash_result):
-        """Layer 2: Strategy"""
-        try:
-            logger.info(f"🎯 Gemini Pro analyzing {symbol}...")
-            
-            candle_text = self.prepare_candle_text(candles[-50:])
-            
-            prompt = f"""Deep analysis for {symbol} F&O trading.
-
-**Spot:** ₹{spot_price:,.2f}
-
-**Chart Data (50 candles):**
-{candle_text}
-
-**Flash AI:** {flash_result['response']}
-
-**Your Task:**
-1. Confirm trade viability (YES/NO)
-2. Suggest strategy:
-   - Direction: BULLISH/BEARISH
-   - Entry zone
-   - Target & Stop loss levels
-   - Risk assessment
-
-Format:
-YES/NO
-Direction: [BULLISH/BEARISH]
-Entry: ₹[price]
-Target: ₹[price]
-Stop Loss: ₹[price]
-Risk: [comment]
-"""
-            
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.5,
-                    "maxOutputTokens": 300
-                }
-            }
-            
-            response = requests.post(
-                f"{GEMINI_PRO_URL}?key={GEMINI_API_KEY}",
-                headers={'Content-Type': 'application/json'},
-                json=payload,
-                timeout=60
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                ai_response = result['candidates'][0]['content']['parts'][0]['text'].strip()
-                logger.info(f"🎯 Pro: {ai_response[:200]}...")
-                
-                approved = ai_response.upper().startswith('YES')
-                return {'approved': approved, 'response': ai_response}
-            
-            return {'approved': False, 'response': 'API Error'}
-            
-        except Exception as e:
-            logger.error(f"❌ Pro error: {e}")
-            return {'approved': False, 'response': str(e)}
-    
-    async def gpt4o_final_call(self, symbol, candles, chart_base64, spot_price, flash_result, pro_result):
-        """Layer 3: Final call with vision"""
-        try:
-            logger.info(f"🤖 GPT-4o final call for {symbol}...")
-            
-            candle_text = self.prepare_candle_text(candles[-50:])
-            
-            prompt = f"""FINAL TRADING DECISION for {symbol}.
-
-**Spot:** ₹{spot_price:,.2f}
-
-**Chart (last 50 candles):**
-{candle_text}
-
-**AI Layer 1:** {flash_result['response']}
-
-**AI Layer 2:** {pro_result['response']}
-
-**YOUR DECISION:**
-Analyze chart image + data. Give FINAL TRADE SIGNAL.
-
-Format:
-TRADE: YES/NO
-DIRECTION: BULLISH/BEARISH/NEUTRAL
-ENTRY: ₹[price]
-TARGET: ₹[price] (+[%])
-STOP_LOSS: ₹[price] (-[%])
-RISK_REWARD: [ratio]
-CONFIDENCE: [%]
-REASON: [2-3 lines]
-
-If NO: TRADE: NO - [reason]
-"""
-            
-            payload = {
-                "model": "gpt-4o",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{chart_base64}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 500,
-                "temperature": 0.3
-            }
-            
-            response = requests.post(
-                OPENAI_GPT4_URL,
-                headers={
-                    'Content-Type': 'application/json',
-                    'Authorization': f'Bearer {OPENAI_API_KEY}'
-                },
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                ai_response = result['choices'][0]['message']['content'].strip()
-                logger.info(f"🤖 GPT-4o: {ai_response[:200]}...")
-                
-                # Parse response
-                trade_signal = self.parse_signal(ai_response, symbol, spot_price)
-                return trade_signal
-            
-            return {'trade': False, 'reason': 'API Error'}
-            
-        except Exception as e:
-            logger.error(f"❌ GPT-4o error: {e}")
-            return {'trade': False, 'reason': str(e)}
-    
-    def parse_signal(self, text, symbol, spot):
-        """Parse AI response"""
-        lines = text.strip().split('\n')
-        signal = {
-            'symbol': symbol,
-            'spot_price': spot,
-            'trade': False
-        }
-        
-        for line in lines:
-            line = line.strip()
-            if line.startswith('TRADE:'):
-                signal['trade'] = 'YES' in line.upper()
-            elif line.startswith('DIRECTION:'):
-                signal['direction'] = line.split(':', 1)[1].strip()
-            elif line.startswith('ENTRY:'):
-                signal['entry'] = line.split(':', 1)[1].strip()
-            elif line.startswith('TARGET:'):
-                signal['target'] = line.split(':', 1)[1].strip()
-            elif line.startswith('STOP_LOSS:'):
-                signal['stop_loss'] = line.split(':', 1)[1].strip()
-            elif line.startswith('RISK_REWARD:'):
-                signal['risk_reward'] = line.split(':', 1)[1].strip()
-            elif line.startswith('CONFIDENCE:'):
-                signal['confidence'] = line.split(':', 1)[1].strip()
-            elif line.startswith('REASON:'):
-                signal['reason'] = line.split(':', 1)[1].strip()
-        
-        return signal
-    
-    async def analyze_stock(self, symbol):
-        """Complete analysis with test mode support"""
-        try:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"🔍 ANALYZING: {symbol}")
-            logger.info(f"{'='*60}")
-            
-            if symbol not in self.security_map:
-                return None
-            
-            info = self.security_map[symbol]
-            security_id = info['security_id']
-            segment = info['segment']
-            
-            # Check if test mode or market closed
-            if self.test_mode or not self.is_market_open():
-                logger.info(f"🧪 Using MOCK DATA for {symbol}")
-                
-                # Mock data with realistic prices
-                mock_prices = {
-                    "NIFTY 50": 24500,
-                    "NIFTY BANK": 51000,
-                    "RELIANCE": 2850,
-                    "HDFCBANK": 1650,
-                    "ICICIBANK": 1250,
-                    "INFY": 1850,
-                    "SBIN": 820
-                }
-                
-                base_price = mock_prices.get(symbol, 1000)
-                candles, spot_price = self.generate_mock_data(symbol, base_price)
-                
-            else:
-                # Real market data
-                spot_price = self.get_spot_price(security_id, segment)
-                if spot_price == 0:
-                    logger.warning(f"⚠️ {symbol}: No spot price")
-                    return None
-                
-                candles = self.get_intraday_candles(security_id, segment)
-                if not candles or len(candles) < 50:
-                    logger.warning(f"⚠️ {symbol}: Insufficient candles")
-                    return None
-            
-            # Create chart
-            chart_buf, chart_base64 = self.create_chart(candles, symbol, spot_price)
-            if not chart_base64:
-                logger.warning(f"⚠️ {symbol}: Chart failed")
-                return None
-            
-            # Layer 1: Flash
-            await asyncio.sleep(1)
-            flash_result = await self.gemini_flash_scan(symbol, candles, spot_price)
-            
-            if not flash_result['approved']:
-                logger.info(f"❌ {symbol}: Flash rejected - {flash_result['response']}")
-                return None
-            
-            # Layer 2: Pro
-            await asyncio.sleep(1)
-            pro_result = await self.gemini_pro_strategy(symbol, candles, spot_price, flash_result)
-            
-            if not pro_result['approved']:
-                logger.info(f"❌ {symbol}: Pro rejected")
-                return None
-            
-            # Layer 3: GPT-4o
-            await asyncio.sleep(1)
-            trade_signal = await self.gpt4o_final_call(symbol, candles, chart_base64, spot_price, flash_result, pro_result)
-            
-            if not trade_signal.get('trade'):
-                logger.info(f"❌ {symbol}: GPT-4o rejected")
-                return None
-            
-            logger.info(f"🎉 {symbol}: TRADE SIGNAL!")
-            
-            return {
-                'symbol': symbol,
-                'spot_price': spot_price,
-                'chart_buf': chart_buf,
-                'flash_result': flash_result,
-                'pro_result': pro_result,
-                'trade_signal': trade_signal,
-                'timestamp': datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
-                'test_mode': self.test_mode or not self.is_market_open()
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Analysis error for {symbol}: {e}")
+            logger.error(f"Error creating chart for {symbol}: {e}")
             return None
     
-    async def send_trade_signal(self, result):
-        """Send to Telegram"""
+    def get_nearest_expiry(self, security_id, segment):
+        """सर्वात जवळचा expiry काढतो"""
         try:
-            symbol = result['symbol']
-            signal = result['trade_signal']
-            is_test = result.get('test_mode', False)
+            payload = {
+                "UnderlyingScrip": security_id,
+                "UnderlyingSeg": segment
+            }
             
-            # Chart
-            if result.get('chart_buf'):
-                caption = f"📊 {symbol} Technical Chart"
-                if is_test:
-                    caption += " [TEST MODE - Mock Data]"
+            response = requests.post(
+                DHAN_EXPIRY_LIST_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success' and data.get('data'):
+                    expiries = data['data']
+                    if expiries:
+                        return expiries[0]
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting expiry: {e}")
+            return None
+    
+    def get_option_chain(self, security_id, segment, expiry):
+        """Option chain data घेतो"""
+        try:
+            payload = {
+                "UnderlyingScrip": security_id,
+                "UnderlyingSeg": segment,
+                "Expiry": expiry
+            }
+            
+            response = requests.post(
+                DHAN_OPTION_CHAIN_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('data'):
+                    return data['data']
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting option chain: {e}")
+            return None
+    
+    def format_option_chain_message(self, symbol, data, expiry):
+        """Option chain साठी सुंदर message format"""
+        try:
+            spot_price = data.get('last_price', 0)
+            oc_data = data.get('oc', {})
+            
+            if not oc_data:
+                return None
+            
+            strikes = sorted([float(s) for s in oc_data.keys()])
+            atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
+            
+            atm_idx = strikes.index(atm_strike)
+            start_idx = max(0, atm_idx - 5)
+            end_idx = min(len(strikes), atm_idx + 6)
+            selected_strikes = strikes[start_idx:end_idx]
+            
+            msg = f"📊 *{symbol} OPTION CHAIN*\n"
+            msg += f"📅 Expiry: {expiry}\n"
+            msg += f"💰 Spot: ₹{spot_price:,.2f}\n"
+            msg += f"🎯 ATM: ₹{atm_strike:,.0f}\n\n"
+            
+            msg += "```\n"
+            msg += "Strike   CE-LTP  CE-OI  CE-Vol  PE-LTP  PE-OI  PE-Vol\n"
+            msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            
+            for strike in selected_strikes:
+                strike_key = f"{strike:.6f}"
+                strike_data = oc_data.get(strike_key, {})
                 
-                await self.bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=result['chart_buf'],
-                    caption=caption
-                )
-                await asyncio.sleep(1)
+                ce = strike_data.get('ce', {})
+                pe = strike_data.get('pe', {})
+                
+                ce_ltp = ce.get('last_price', 0)
+                ce_oi = ce.get('oi', 0)
+                ce_vol = ce.get('volume', 0)
+                
+                pe_ltp = pe.get('last_price', 0)
+                pe_oi = pe.get('oi', 0)
+                pe_vol = pe.get('volume', 0)
+                
+                atm_mark = "🔸" if strike == atm_strike else "  "
+                
+                msg += f"{atm_mark}{strike:6.0f}  {ce_ltp:6.1f} {ce_oi/1000:6.0f}K {ce_vol/1000:6.0f}K  {pe_ltp:6.1f} {pe_oi/1000:6.0f}K {pe_vol/1000:6.0f}K\n"
             
-            # Signal message
-            msg = f"🎯 *TRADE SIGNAL: {symbol}*\n"
-            if is_test:
-                msg += "🧪 *[TEST MODE - Mock Data]*\n"
-            msg += "\n"
-            msg += f"💰 Spot: ₹{result['spot_price']:,.2f}\n"
-            msg += f"🎲 Direction: {signal.get('direction', 'N/A')}\n\n"
-            msg += f"📈 *ENTRY:* {signal.get('entry', 'N/A')}\n"
-            msg += f"🎯 *TARGET:* {signal.get('target', 'N/A')}\n"
-            msg += f"🛑 *STOP LOSS:* {signal.get('stop_loss', 'N/A')}\n"
-            msg += f"📊 *R:R:* {signal.get('risk_reward', 'N/A')}\n"
-            msg += f"🎲 *CONFIDENCE:* {signal.get('confidence', 'N/A')}\n\n"
-            msg += f"💡 *REASON:*\n{signal.get('reason', 'N/A')}\n\n"
-            msg += f"┌─── AI LAYERS ───┐\n"
-            msg += f"│ ⚡ Flash: ✅\n"
-            msg += f"│ 🎯 Pro: ✅\n"
-            msg += f"│ 🤖 GPT-4o: ✅\n"
-            msg += f"└─────────────────┘\n\n"
-            msg += f"🕐 {result['timestamp']}"
+            msg += "```\n\n"
+            
+            # Greeks आणि IV (ATM साठी)
+            atm_data = oc_data.get(f"{atm_strike:.6f}", {})
+            if atm_data:
+                ce_greeks = atm_data.get('ce', {}).get('greeks', {})
+                pe_greeks = atm_data.get('pe', {}).get('greeks', {})
+                ce_iv = atm_data.get('ce', {}).get('implied_volatility', 0)
+                pe_iv = atm_data.get('pe', {}).get('implied_volatility', 0)
+                
+                msg += "📈 *ATM Greeks & IV:*\n"
+                msg += f"CE: Δ={ce_greeks.get('delta', 0):.3f} Θ={ce_greeks.get('theta', 0):.2f} IV={ce_iv:.1f}%\n"
+                msg += f"PE: Δ={pe_greeks.get('delta', 0):.3f} Θ={pe_greeks.get('theta', 0):.2f} IV={pe_iv:.1f}%\n"
+            
+            return msg
+            
+        except Exception as e:
+            logger.error(f"Error formatting message for {symbol}: {e}")
+            return None
+    
+    async def send_option_chain_batch(self, symbols_batch):
+        """एका batch चे option chain data + chart + AI analysis पाठवतो"""
+        for symbol in symbols_batch:
+            try:
+                if symbol not in self.security_id_map:
+                    logger.warning(f"Skipping {symbol} - No security ID")
+                    continue
+                
+                info = self.security_id_map[symbol]
+                security_id = info['security_id']
+                segment = info['segment']
+                
+                # Nearest expiry शोधतो
+                expiry = self.get_nearest_expiry(security_id, segment)
+                if not expiry:
+                    logger.warning(f"{symbol}: Expiry नाही मिळाला")
+                    continue
+                
+                logger.info(f"Fetching data for {symbol} (Expiry: {expiry})...")
+                
+                # Option chain data घेतो
+                oc_data = self.get_option_chain(security_id, segment, expiry)
+                if not oc_data:
+                    logger.warning(f"{symbol}: Option chain data नाही मिळाला")
+                    continue
+                
+                spot_price = oc_data.get('last_price', 0)
+                
+                # Historical data घेतो
+                logger.info(f"Fetching historical candles for {symbol}...")
+                candles = self.get_historical_data(security_id, segment, symbol)
+                
+                # Chart तयार करतो
+                chart_buf = None
+                if candles:
+                    logger.info(f"Creating candlestick chart for {symbol}...")
+                    chart_buf = self.create_candlestick_chart(candles, symbol, spot_price)
+                
+                # 🤖 AI Analysis (Gemini Flash)
+                ai_analysis = None
+                if self.gemini:
+                    logger.info(f"🤖 Getting Gemini AI analysis for {symbol}...")
+                    
+                    # Chart + Option data analysis
+                    if chart_buf and candles:
+                        ai_analysis = self.gemini.analyze_chart(
+                            chart_buf, 
+                            symbol, 
+                            candles, 
+                            oc_data
+                        )
+                    # Fallback: फक्त option chain analysis
+                    elif not chart_buf:
+                        ai_analysis = self.gemini.analyze_option_chain_only(
+                            symbol, 
+                            oc_data
+                        )
+                
+                # 1️⃣ Chart पाठवतो
+                if chart_buf:
+                    await self.bot.send_photo(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        photo=chart_buf,
+                        caption=f"📊 {symbol} - Last {len(candles)} Candles (5-min)"
+                    )
+                    logger.info(f"✅ {symbol} chart sent")
+                    await asyncio.sleep(1)
+                
+                # 2️⃣ Option chain message पाठवतो
+                message = self.format_option_chain_message(symbol, oc_data, expiry)
+                if message:
+                    await self.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=message,
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"✅ {symbol} option chain sent")
+                    await asyncio.sleep(1)
+                
+                # 3️⃣ AI Analysis पाठवतो (if available)
+                if ai_analysis:
+                    ai_msg = f"🤖 *Gemini AI Analysis - {symbol}*\n\n{ai_analysis}"
+                    await self.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=ai_msg,
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"✅ {symbol} AI analysis sent")
+                
+                # Rate limit साठी थांबतो
+                await asyncio.sleep(3)
+                
+            except Exception as e:
+                logger.error(f"Error processing {symbol}: {e}")
+                await asyncio.sleep(3)
+    
+    async def run(self):
+        """Main loop - every 5 minutes option chain + chart + AI analysis पाठवतो"""
+        logger.info("🚀 Bot started! Loading security IDs...")
+        
+        # Security IDs load करतो
+        success = await self.load_security_ids()
+        if not success:
+            logger.error("Failed to load security IDs. Exiting...")
+            return
+        
+        await self.send_startup_message()
+        
+        # Symbols ला batches मध्ये divide करतो
+        all_symbols = list(self.security_id_map.keys())
+        batch_size = 5
+        batches = [all_symbols[i:i+batch_size] for i in range(0, len(all_symbols), batch_size)]
+        
+        logger.info(f"Total {len(all_symbols)} symbols in {len(batches)} batches")
+        
+        while self.running:
+            try:
+                timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Starting update cycle at {timestamp}")
+                logger.info(f"{'='*50}")
+                
+                # प्रत्येक batch process करतो
+                for batch_num, batch in enumerate(batches, 1):
+                    logger.info(f"\n📦 Processing Batch {batch_num}/{len(batches)}: {batch}")
+                    await self.send_option_chain_batch(batch)
+                    
+                    # Batches मध्ये 5 second gap
+                    if batch_num < len(batches):
+                        logger.info(f"Waiting 5 seconds before next batch...")
+                        await asyncio.sleep(5)
+                
+                logger.info("\n✅ All batches completed!")
+                logger.info("⏳ Waiting 5 minutes for next cycle...\n")
+                
+                # 5 minutes wait
+                await asyncio.sleep(300)
+                
+            except KeyboardInterrupt:
+                logger.info("Bot stopped by user")
+                self.running = False
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(60)
+    
+    async def send_startup_message(self):
+        """Bot सुरू झाल्यावर message पाठवतो"""
+        try:
+            msg = "🤖 *Dhan Option Chain Bot + Gemini AI Started!*\n\n"
+            msg += f"📊 Tracking {len(self.security_id_map)} stocks/indices\n"
+            msg += "⏱️ Updates every 5 minutes\n"
+            msg += "📈 Features:\n"
+            msg += "  • 📊 Candlestick Charts (5-min)\n"
+            msg += "  • 📉 Option Chain: CE/PE LTP, OI, Volume\n"
+            msg += "  • 🎯 Greeks & Implied Volatility\n"
+            
+            if self.gemini:
+                msg += "  • 🤖 *Gemini AI Analysis*\n"
+                msg += "     - Chart Pattern Recognition\n"
+                msg += "     - Option Chain Insights\n"
+                msg += "     - PCR Analysis\n"
+                msg += "     - Trade Recommendations\n"
+                msg += "     - Support/Resistance Levels\n"
+            else:
+                msg += "  • ⚠️ AI Analysis: Disabled\n"
+            
+            msg += "\n✅ Powered by DhanHQ API v2\n"
+            msg += "🤖 AI: Google Gemini 2.0 Flash\n"
+            msg += "🚂 Deployed on Railway.app\n\n"
+            msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
             
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=msg,
                 parse_mode='Markdown'
             )
-            
-            logger.info(f"✅ Signal sent for {symbol}")
-            
+            logger.info("Startup message sent")
         except Exception as e:
-            logger.error(f"❌ Send error: {e}")
-    
-    async def run(self):
-        """Main loop"""
-        logger.info("🚀 Simple Chart AI Bot starting...")
-        
-        if not await self.load_securities():
-            logger.error("❌ Failed to load securities")
-            return
-        
-        # Startup message
-        msg = "🤖 *Chart AI Bot Started!*\n\n"
-        msg += f"📊 Tracking: {len(self.security_map)} stocks\n"
-        msg += "⚡ AI: Gemini + GPT-4o\n"
-        msg += "📈 Chart-only analysis\n"
-        msg += "⏱️ Scan: Every 5 min"
-        
-        await self.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=msg,
-            parse_mode='Markdown'
-        )
-        
-        all_symbols = list(self.security_map.keys())
-        
-        while self.running:
-            try:
-                logger.info(f"\n{'='*70}")
-                logger.info(f"🔄 SCAN CYCLE: {datetime.now().strftime('%H:%M:%S')}")
-                logger.info(f"{'='*70}\n")
-                
-                scanned = 0
-                approved = 0
-                rejected = 0
-                
-                for idx, symbol in enumerate(all_symbols, 1):
-                    logger.info(f"\n[{idx}/{len(all_symbols)}] {symbol}")
-                    
-                    result = await self.analyze_stock(symbol)
-                    scanned += 1
-                    
-                    if result:
-                        approved += 1
-                        await self.send_trade_signal(result)
-                        self.trade_signals.append(result)
-                    else:
-                        rejected += 1
-                    
-                    # 5 sec delay between stocks (Gemini rate limit)
-                    if idx < len(all_symbols):
-                        logger.info("⏳ 5 sec wait...")
-                        await asyncio.sleep(5)
-                
-                logger.info(f"\n{'='*70}")
-                logger.info(f"✅ Scan done: {scanned} | ✅ {approved} | ❌ {rejected}")
-                logger.info(f"{'='*70}\n")
-                
-                # Summary message
-                summary = f"📊 *Scan Completed*\n\n"
-                summary += f"Scanned: {scanned}\n"
-                summary += f"Signals: {approved}\n"
-                summary += f"Rejected: {rejected}\n\n"
-                summary += "⏳ Next scan in 5 minutes"
-                
-                await self.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=summary,
-                    parse_mode='Markdown'
-                )
-                
-                # Wait 5 minutes
-                logger.info("⏸️ Waiting 5 minutes...\n")
-                await asyncio.sleep(300)
-                
-            except KeyboardInterrupt:
-                logger.info("🛑 Stopped by user")
-                self.running = False
-                break
-            except Exception as e:
-                logger.error(f"❌ Main loop error: {e}")
-                await asyncio.sleep(60)
+            logger.error(f"Error sending startup message: {e}")
 
 
+# ========================
+# BOT RUN करा
+# ========================
 if __name__ == "__main__":
     try:
-        # Check env vars
-        required = [
-            TELEGRAM_BOT_TOKEN,
-            TELEGRAM_CHAT_ID,
-            DHAN_CLIENT_ID,
-            DHAN_ACCESS_TOKEN,
-            GEMINI_API_KEY,
-            OPENAI_API_KEY
+        # Environment variables check
+        required_vars = [
+            TELEGRAM_BOT_TOKEN, 
+            TELEGRAM_CHAT_ID, 
+            DHAN_CLIENT_ID, 
+            DHAN_ACCESS_TOKEN
         ]
         
-        if not all(required):
+        if not all(required_vars):
             logger.error("❌ Missing environment variables!")
-            logger.error("Required: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, GEMINI_API_KEY, OPENAI_API_KEY")
+            logger.error("Required: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN")
             exit(1)
         
-        bot = SimpleChartAIBot()
-        asyncio.run(bot.run())
+        if not GEMINI_API_KEY:
+            logger.warning("⚠️ GEMINI_API_KEY not set - AI analysis will be disabled")
         
+        bot = DhanOptionChainBot()
+        asyncio.run(bot.run())
     except Exception as e:
-        logger.error(f"💥 Fatal error: {e}")
+        logger.error(f"Fatal error: {e}")
         exit(1)
