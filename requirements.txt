@@ -1,8 +1,19 @@
+# Telegram Bot
 python-telegram-bot==20.7
+
+# HTTP Requests
 requests==2.31.0
+
+# Chart/Graph Libraries
 matplotlib==3.7.1
 mplfinance==0.12.10b0
 pandas==2.0.3
-google-genai==0.11.0
-google-auth
-Pillow
+
+# Image Processing
+Pillow==10.0.0
+
+# Google Gemini AI
+google-generativeai==0.3.2
+
+# Additional utilities (if needed)
+python-dotenv==1.0.0
