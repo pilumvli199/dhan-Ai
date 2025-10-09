@@ -51,62 +51,67 @@ STOCKS_WATCHLIST = [
 ]
 
 # --- GEMINI AI ANALYZER ---
-class GeminiPriceActionAnalyzer:
+class GeminiAnalyzer:
     def __init__(self):
         self.model = genai.GenerativeModel('gemini-1.5-flash') if GEMINI_API_KEY else None
 
     def format_data_for_ai(self, symbol, oc_data, candles_df):
         spot_price = oc_data.get('spotPrice', 0)
         
-        oc_text = "STRIKE | CE OI (Lakhs) | PE OI (Lakhs)\n"
-        all_strikes = sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice'])
-        max_ce_oi = max(all_strikes, key=lambda x: x.get('ce_openInterest', 0))
-        max_pe_oi = max(all_strikes, key=lambda x: x.get('pe_openInterest', 0))
-
-        oc_text += f"Max CE OI at: {max_ce_oi['strikePrice']} ({max_ce_oi.get('ce_openInterest',0)/100000:.2f}L) -> Resistance\n"
-        oc_text += f"Max PE OI at: {max_pe_oi['strikePrice']} ({max_pe_oi.get('pe_openInterest',0)/100000:.2f}L) -> Support\n"
+        # Format Option Chain for key levels
+        oc_text = ""
+        try:
+            all_strikes = sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice'])
+            max_ce_oi = max(all_strikes, key=lambda x: x.get('ce_openInterest', 0))
+            max_pe_oi = max(all_strikes, key=lambda x: x.get('pe_openInterest', 0))
+            oc_text += f"Max CE OI (Resistance) at: {max_ce_oi['strikePrice']} ({max_ce_oi.get('ce_openInterest',0)/100000:.2f}L)\n"
+            oc_text += f"Max PE OI (Support) at: {max_pe_oi['strikePrice']} ({max_pe_oi.get('pe_openInterest',0)/100000:.2f}L)\n"
+        except (ValueError, TypeError):
+             oc_text = "Option chain data is limited.\n"
         
+        # Format Candle Data
         candle_text = "Time | Open | High | Low | Close | Volume\n"
         for _, row in candles_df.tail(30).iterrows():
             candle_text += f"{row.name.strftime('%H:%M')} | {row.Open:.2f} | {row.High:.2f} | {row.Low:.2f} | {row.Close:.2f} | {row.Volume:,}\n"
 
-        return f"""You are an expert Price Action trader. Your goal is to analyze the provided chart image, option chain data, and raw candle data to find a high-probability trade. Do not use complex indicators. Focus only on what you see.
+        # This is the new, deep analysis prompt
+        return f"""You are an expert F&O trader specializing in Price Action, Chart Patterns, and Option Chain analysis. Analyze the provided data for {symbol} and create a detailed trade setup in simple Marathi.
 
-## Market Data for {symbol}
-- **Spot Price:** ₹{spot_price:,.2f}
+## Market Data
+- **Symbol:** {symbol} | **Spot Price:** ₹{spot_price:,.2f}
 - **Option Chain Key Levels:**
 {oc_text}
-- **Recent Price Action (Raw Data):**
+- **Recent Price Action (Last 30 Candles):**
 {candle_text}
 
 ---
-## Analysis & Trade Alert (in simple Marathi):
+## Analysis & Trade Alert (in Marathi):
 
-**1. Price Action & Chart Pattern Analysis:**
-   - Chart image आणि raw data बघून सध्याचा ट्रेंड काय आहे (Uptrend/Downtrend/Sideways)?
-   - महत्त्वाचे Support आणि Resistance levels कोणते आहेत?
-   - कोणता Chart Pattern दिसत आहे का? (उदा. Breakout, Triangle, Channel, Double Top/Bottom)
-   - महत्त्वाचे Candlestick Patterns (उदा. Engulfing, Doji, Hammer) कोणते दिसत आहेत?
+**1. Price Action & Chart Analysis (Chart Image बघून):**
+   - **Trend:** सध्याचा ट्रेंड काय आहे (Clear Uptrend/Downtrend/Sideways/Volatile)?
+   - **Support/Resistance:** Chart नुसार महत्त्वाचे Support आणि Resistance levels कोणते आहेत?
+   - **Chart Pattern:** कोणता Chart Pattern तयार होत आहे का? (उदा. Breakout from range, Triangle, Channel, Flag, Double Top/Bottom).
+   - **Candlestick Story:** शेवटच्या काही Candlesticks काय दर्शवत आहेत (उदा. Strong Bullish/Bearish Engulfing, Rejection from top/bottom, Doji indicating indecision)?
 
 **2. Option Chain Sentiment:**
-   - Option Chain नुसार, सर्वात मोठा Support (Max PE OI) आणि Resistance (Max CE OI) कुठे आहे?
-   - यावरून बाजाराचा कल (sentiment) काय वाटतो (Bullish/Bearish)?
+   - Option Chain नुसार, सर्वात मोठा Support (Max PE OI) आणि Resistance (Max CE OI) कुठे आहे? ते Spot Price पासून जवळ आहे की दूर?
+   - यावरून Option Writers चा कल काय वाटतो (Bulls in control / Bears in control)?
 
 **3. 🚨 Final Verdict & Trade Alert:**
    - **Trade Setup आहे का?** (Yes/No)
    - **Action:** (BUY CE / BUY PE)?
-   - **Strike:** ₹[STRIKE]
-   - **Entry Price (Option Premium):** ₹[ENTRY]
+   - **Strike Price:** ₹[STRIKE]
+   - **Entry Price (Option Premium):** ₹[ENTRY] च्या जवळ
    - **Target:** ₹[TARGET]
    - **Stop Loss:** ₹[SL]
-   - **Reason (थोडक्यात):** (हा ट्रेड का घ्यावा याची २-३ कारणे).
-   - **No Trade:** जर स्पष्ट trade नसेल, तर "सध्या कोणताही स्पष्ट ट्रेड नाही. Breakout/Breakdown ची वाट पहा." असे लिहा.
+   - **Reasoning (थोडक्यात):** (हा ट्रेड का घ्यावा याची २-३ ठोस कारणे, उदा. 'Trendline breakout confirmed with high volume' or 'Rejection from strong resistance indicated by max Call OI').
+   - **No Trade:** जर स्पष्ट trade नसेल, तर "सध्या कोणताही स्पष्ट ट्रेड नाही. Range-bound मार्केट आहे, Breakout/Breakdown ची वाट पहा." असे लिहा.
 """
 
     async def analyze(self, symbol, chart_buf, oc_data, candles_df):
         if not self.model: return "AI analysis is disabled."
         try:
-            logger.info(f"🤖 Running Price Action analysis for {symbol}...")
+            logger.info(f"🤖 Running Deep Analysis for {symbol}...")
             prompt = self.format_data_for_ai(symbol, oc_data, candles_df)
             
             chart_buf.seek(0)
@@ -124,8 +129,8 @@ class DhanTradingBot:
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.headers = {'access-token': DHAN_ACCESS_TOKEN}
         self.security_id_map = {}
-        self.gemini_analyzer = GeminiPriceActionAnalyzer()
-        logger.info("🚀 Price Action AI Bot Initialized (IST Timezone Fixed)")
+        self.gemini_analyzer = GeminiAnalyzer()
+        logger.info("🚀 AI Trading Bot Initialized (Final Version)")
 
     async def load_security_ids(self):
         try:
@@ -134,29 +139,40 @@ class DhanTradingBot:
             response.raise_for_status()
             
             all_rows = list(csv.DictReader(io.StringIO(response.text)))
-            today = datetime.now(IST) # USE IST TIMEZONE
+            today = datetime.now(IST)
             self.security_id_map.clear()
 
+            # First Pass: Map Equity Symbol to its Security ID
+            equity_id_map = {}
+            for row in all_rows:
+                if row.get('SEM_EXM_EXCH_ID') == 'NSE' and row.get('SEM_INSTRUMENT_TYPE') == 'EQUITY':
+                    equity_id_map[row.get('SEM_TRADING_SYMBOL')] = int(row.get('SEM_SMST_SECURITY_ID'))
+
+            # Second Pass: Find Futures using the Equity Map
             for symbol in STOCKS_WATCHLIST:
+                if symbol not in equity_id_map:
+                    logger.warning(f"Could not find equity entry for {symbol}")
+                    continue
+                
+                underlying_equity_id = equity_id_map[symbol]
                 futures = []
                 for row in all_rows:
                     try:
-                        if (row.get('SEM_TRADING_SYMBOL') == symbol and 
+                        if (row.get('SEM_UNDERLYING_SECURITY_ID') == str(underlying_equity_id) and 
                             row.get('SEM_INSTRUMENT_TYPE') == 'FUTSTK' and
                             row.get('SEM_EXM_EXCH_ID') == 'NFO'):
                             
                             expiry_date_str = row.get('SEM_EXPIRY_DATE', '').split(' ')[0]
-                            expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d')
-                            expiry_date_ist = IST.localize(expiry_date) # Make expiry date timezone-aware
+                            expiry_date = IST.localize(datetime.strptime(expiry_date_str, '%Y-%m-%d'))
                             
-                            if expiry_date_ist > today:
-                                futures.append({'expiry': expiry_date_ist, 'fno_id': int(row.get('SEM_SMST_SECURITY_ID')), 'equity_id': int(row.get('SEM_UNDERLYING_SECURITY_ID'))})
+                            if expiry_date > today:
+                                futures.append({'expiry': expiry_date, 'fno_id': int(row.get('SEM_SMST_SECURITY_ID')), 'equity_id': underlying_equity_id})
                     except (ValueError, TypeError): continue
                 
                 if futures:
                     nearest = min(futures, key=lambda x: x['expiry'])
                     self.security_id_map[symbol] = nearest
-                    logger.info(f"✅ {symbol}: Loaded F&O Security ID = {nearest['fno_id']}")
+                    logger.info(f"✅ {symbol}: Loaded F&O ID = {nearest['fno_id']} (Equity ID = {nearest['equity_id']})")
             
             logger.info(f"Total {len(self.security_id_map)} F&O securities loaded.")
             return len(self.security_id_map) > 0
@@ -173,17 +189,28 @@ class DhanTradingBot:
             logger.error(f"API call to {url} failed: {e}")
             return None
 
-    def create_chart(self, df, symbol, spot_price):
+    def create_enhanced_chart(self, df, symbol, spot_price):
         try:
             df_chart = df.copy(); df_chart.set_index('Date', inplace=True)
             df_chart['SMA20'] = df_chart['Close'].rolling(window=20).mean()
             df_chart['SMA50'] = df_chart['Close'].rolling(window=50).mean()
-            mc = mpf.make_marketcolors(up='#10FF70', down='#FF3333', inherit=True)
+            sma20 = df_chart['SMA20']; std20 = df_chart['Close'].rolling(window=20).std()
+            df_chart['BB_Upper'] = sma20 + (std20 * 2)
+            df_chart['BB_Lower'] = sma20 - (std20 * 2)
+
+            mc = mpf.make_marketcolors(up='#00ff88', down='#ff4444', inherit=True)
             s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds', rc={'font.size': 12})
-            apds = [mpf.make_addplot(df_chart['SMA20'], color='#FFD700'), mpf.make_addplot(df_chart['SMA50'], color='#00BFFF')]
-            fig, axes = mpf.plot(df_chart.tail(120), type='candle', style=s, volume=True, addplot=apds, title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}', figsize=(16, 8), returnfig=True)
-            axes[0].legend(['SMA20', 'SMA50'])
-            buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=120, bbox_inches='tight'); buf.seek(0)
+            apds = [
+                mpf.make_addplot(df_chart['SMA20'], color='#ffa500', width=1.2),
+                mpf.make_addplot(df_chart['SMA50'], color='#00bfff', width=1.2),
+                mpf.make_addplot(df_chart['BB_Upper'], color='#9370db', width=0.8, linestyle='--'),
+                mpf.make_addplot(df_chart['BB_Lower'], color='#9370db', width=0.8, linestyle='--'),
+            ]
+            fig, axes = mpf.plot(df_chart.tail(120), type='candle', style=s, volume=True, addplot=apds,
+                                 title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}', figsize=(16, 9), returnfig=True,
+                                 panel_ratios=(4, 1), volume_panel=1)
+            axes[0].legend(['SMA20', 'SMA50', 'Bollinger', 'Bands'])
+            buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=150, bbox_inches='tight'); buf.seek(0)
             return buf
         except Exception as e:
             logger.error(f"Error creating chart for {symbol}: {e}")
@@ -191,14 +218,14 @@ class DhanTradingBot:
 
     async def process_stock(self, symbol):
         try:
+            if symbol not in self.security_id_map: return
             info = self.security_id_map[symbol]
             logger.info(f"--- Processing {symbol} ---")
+
             oc_data = self.get_api_data(DHAN_OPTION_CHAIN_URL, {'securityId': str(info['fno_id']), 'exchangeSegment': 'NSE_FNO'})
             if not oc_data: return
-            
-            # USE IST TIMEZONE FOR DATES
-            to_date = datetime.now(IST)
-            from_date = to_date - timedelta(days=7)
+
+            to_date = datetime.now(IST); from_date = to_date - timedelta(days=7)
             hist_payload = {"securityId": str(info['equity_id']), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "fromDate": from_date.strftime("%Y-%m-%d"), "toDate": to_date.strftime("%Y-%m-%d"), "interval": "FIVE_MINUTE"}
             hist_data = self.get_api_data(DHAN_INTRADAY_URL, hist_payload)
             if not hist_data: return
@@ -207,16 +234,18 @@ class DhanTradingBot:
             if len(candles_df) < 50: return
             
             spot_price = oc_data.get('spotPrice', 0)
-            chart_buf = self.create_chart(candles_df, symbol, spot_price)
+            chart_buf = self.create_enhanced_chart(candles_df, symbol, spot_price)
             if not chart_buf: return
 
             ai_analysis_text = await self.gemini_analyzer.analyze(symbol, chart_buf, oc_data, candles_df)
+
             alert_header = f"🚨 **TRADE ALERT: {symbol}** 🚨" if "BUY CE" in ai_analysis_text or "BUY PE" in ai_analysis_text else f"📉 *Analysis for {symbol}*"
             caption = f"{alert_header}\n\n{ai_analysis_text}"
             
             chart_buf.seek(0)
             await self.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=InputFile(chart_buf, filename=f"{symbol}.png"), caption=caption, parse_mode='Markdown')
             logger.info(f"✅ Analysis sent for {symbol}")
+
         except Exception as e:
             logger.error(f"FATAL error processing {symbol}: {e}", exc_info=True)
 
@@ -237,8 +266,7 @@ async def main():
     server_thread = Thread(target=run_server, daemon=True); server_thread.start()
     bot = DhanTradingBot()
     
-    while True: # Auto-retry loop
-        # Check if it's within market hours (approx 9 AM to 4 PM IST)
+    while True:
         now_ist = datetime.now(IST)
         if 9 <= now_ist.hour < 16:
             if await bot.load_security_ids():
@@ -248,19 +276,25 @@ async def main():
                 logger.warning("Failed to load F&O securities during market hours. Retrying in 5 mins...")
                 await asyncio.sleep(300)
         else:
-            logger.info(f"Market is closed. Current IST: {now_ist.strftime('%H:%M:%S')}. Waiting for market to open...")
-            await asyncio.sleep(600) # Wait 10 minutes
+            logger.info(f"Market is closed. Current IST: {now_ist.strftime('%H:%M:%S')}. Waiting...")
+            await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"😴 Market is closed. Bot is sleeping until 9 AM IST.", parse_mode='Markdown')
+            await asyncio.sleep(3600) # Wait 1 hour if market is closed
 
-    await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **Price Action AI Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
+    await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **AI Trading Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
     while True:
-        logger.info("============== NEW SCAN CYCLE ==============")
-        for symbol in bot.security_id_map.keys():
-            await bot.process_stock(symbol)
-            logger.info("--- Waiting 3 seconds before next stock ---")
-            await asyncio.sleep(3)
-        
-        logger.info("Scan cycle complete. Waiting for 10 minutes...")
-        await asyncio.sleep(600)
+        now_ist = datetime.now(IST)
+        if 9 <= now_ist.hour < 16:
+            logger.info("============== NEW SCAN CYCLE ==============")
+            for symbol in bot.security_id_map.keys():
+                await bot.process_stock(symbol)
+                logger.info("--- Waiting 5 seconds before next stock ---")
+                await asyncio.sleep(5)
+            logger.info("Scan cycle complete. Waiting for 10 minutes...")
+            await asyncio.sleep(600)
+        else:
+            logger.info("Market is now closed. Bot will sleep until next morning.")
+            await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌙 Market closed. Bot is sleeping until 9 AM tomorrow.", parse_mode='Markdown')
+            await asyncio.sleep(3600 * 6) # Sleep for 6 hours
 
 if __name__ == '__main__':
     try:
