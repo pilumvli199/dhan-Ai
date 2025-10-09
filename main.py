@@ -17,10 +17,6 @@ matplotlib.use('Agg')
 import mplfinance as mpf
 import google.generativeai as genai
 
-# Force stdout flush for deployment logs
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
 # --- CONFIGURATION ---
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,7 +55,6 @@ class GeminiPriceActionAnalyzer:
     def format_data_for_ai(self, symbol, oc_data, candles_df):
         spot_price = oc_data.get('spotPrice', 0)
         
-        # Format Option Chain for key levels
         oc_text = "STRIKE | CE OI (Lakhs) | PE OI (Lakhs)\n"
         all_strikes = sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice'])
         max_ce_oi = max(all_strikes, key=lambda x: x.get('ce_openInterest', 0))
@@ -68,15 +63,13 @@ class GeminiPriceActionAnalyzer:
         oc_text += f"Max CE OI at: {max_ce_oi['strikePrice']} ({max_ce_oi.get('ce_openInterest',0)/100000:.2f}L)\n"
         oc_text += f"Max PE OI at: {max_pe_oi['strikePrice']} ({max_pe_oi.get('pe_openInterest',0)/100000:.2f}L)\n"
         
-        # Format Candle Data
         candle_text = "Time | Open | High | Low | Close | Volume\n"
-        for _, row in candles_df.tail(30).iterrows(): # Last 30 candles for context
+        for _, row in candles_df.tail(30).iterrows():
             candle_text += f"{row.name.strftime('%H:%M')} | {row.Open:.2f} | {row.High:.2f} | {row.Low:.2f} | {row.Close:.2f} | {row.Volume:,}\n"
 
-        # Build Final Prompt
-        return f"""You are an expert Price Action trader. Your goal is to analyze the provided chart image, option chain data, and raw candle data to find a high-probability trade. Do not use complex indicators like RSI or MACD. Focus only on what you see.
+        return f"""You are an expert Price Action trader. Analyze the provided chart image, option chain, and raw candle data for {symbol} to find a high-probability trade. Do not use complex indicators. Focus only on what you see.
 
-## Market Data for {symbol}
+## Market Data
 - **Spot Price:** ₹{spot_price:,.2f}
 - **Option Chain Key Levels:**
 {oc_text}
@@ -159,17 +152,14 @@ class DhanTradingBot:
                     logger.info(f"✅ {symbol}: Loaded F&O Security ID = {nearest['fno_id']}")
             
             logger.info(f"Total {len(self.security_id_map)} F&O securities loaded.")
-            return True
+            return len(self.security_id_map) > 0
         except Exception as e:
             logger.error(f"CRITICAL: Error loading security IDs: {e}", exc_info=True)
             return False
 
-    def get_api_data(self, url, payload, method='POST'):
+    def get_api_data(self, url, payload):
         try:
-            if method == 'POST':
-                response = requests.post(url, json=payload, headers=self.headers, timeout=15)
-            else:
-                response = requests.get(url, params=payload, headers=self.headers, timeout=15)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=15)
             response.raise_for_status()
             data = response.json()
             return data.get('data')
@@ -201,15 +191,13 @@ class DhanTradingBot:
 
     async def process_stock(self, symbol):
         try:
-            if symbol not in self.security_id_map: return
             info = self.security_id_map[symbol]
             logger.info(f"--- Processing {symbol} ---")
 
             oc_data = self.get_api_data(DHAN_OPTION_CHAIN_URL, {'securityId': str(info['fno_id']), 'exchangeSegment': 'NSE_FNO'})
             if not oc_data: return
 
-            to_date, from_date = datetime.now(), datetime.now() - timedelta(days=7)
-            hist_payload = {"securityId": str(info['equity_id']), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "fromDate": from_date.strftime("%Y-%m-%d"), "toDate": to_date.strftime("%Y-%m-%d"), "interval": "FIVE_MINUTE"}
+            hist_payload = {"securityId": str(info['equity_id']), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY", "fromDate": (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"), "toDate": datetime.now().strftime("%Y-%m-%d"), "interval": "FIVE_MINUTE"}
             hist_data = self.get_api_data(DHAN_INTRADAY_URL, hist_payload)
             if not hist_data: return
 
@@ -222,13 +210,9 @@ class DhanTradingBot:
 
             ai_analysis_text = await self.gemini_analyzer.analyze(symbol, chart_buf, oc_data, candles_df)
 
-            # Check if AI generated a trade alert
-            if "BUY CE" in ai_analysis_text or "BUY PE" in ai_analysis_text:
-                alert_header = f"🚨 **TRADE ALERT: {symbol}** 🚨"
-            else:
-                alert_header = f"📉 *Analysis for {symbol}*"
-
+            alert_header = f"🚨 **TRADE ALERT: {symbol}** 🚨" if "BUY CE" in ai_analysis_text or "BUY PE" in ai_analysis_text else f"📉 *Analysis for {symbol}*"
             caption = f"{alert_header}\n\n{ai_analysis_text}"
+            
             chart_buf.seek(0)
             await self.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=InputFile(chart_buf, filename=f"{symbol}.png"), caption=caption, parse_mode='Markdown')
             logger.info(f"✅ Analysis sent for {symbol}")
@@ -238,41 +222,40 @@ class DhanTradingBot:
 
 # --- HTTP SERVER & MAIN EXECUTION ---
 class KeepAliveHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.send_header('Content-type', 'text/plain'); self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+    def do_GET(self): self.send_response(200); self.send_header('Content-type', 'text/plain'); self.end_headers(); self.wfile.write(b"Bot is alive!")
 
 def run_server():
     port = int(os.environ.get("PORT", 8080))
-    server_address = ('', port)
     try:
-        httpd = HTTPServer(server_address, KeepAliveHandler)
-        logger.info(f"Starting keep-alive server on port {port}...")
-        httpd.serve_forever()
+        httpd = HTTPServer(('', port), KeepAliveHandler); logger.info(f"Starting keep-alive server on port {port}..."); httpd.serve_forever()
     except Exception: pass
 
 async def main():
     if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
-        logger.critical("❌ Missing critical environment variables. Exiting.")
-        return
+        logger.critical("❌ Missing critical environment variables. Exiting."); return
     
-    server_thread = Thread(target=run_server, daemon=True)
-    server_thread.start()
+    server_thread = Thread(target=run_server, daemon=True); server_thread.start()
     bot = DhanTradingBot()
+    
+    # --- AUTO-RETRY LOOP FOR PRE-MARKET START ---
+    while True:
+        if await bot.load_security_ids():
+            logger.info("Successfully loaded F&O securities. Starting main loop.")
+            break
+        logger.warning("Failed to load F&O securities (market may be closed). Retrying in 5 minutes...")
+        await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⏳ **Market Closed?** Failed to load F&O data. Will retry in 5 minutes...", parse_mode='Markdown')
+        await asyncio.sleep(300) # Wait 5 minutes and retry
 
-    if await bot.load_security_ids():
-        await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **Price Action AI Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
-        while True:
-            logger.info("============== NEW SCAN CYCLE ==============")
-            for symbol in bot.security_id_map.keys():
-                await bot.process_stock(symbol)
-                logger.info("--- Waiting 3 seconds before next stock ---")
-                await asyncio.sleep(3)
-            
-            logger.info("Scan cycle complete. Waiting for 10 minutes...")
-            await asyncio.sleep(600)
-    else:
-        await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="❌ **Bot failed to start.** Could not load F&O security IDs.", parse_mode='Markdown')
+    await bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ **Price Action AI Bot ONLINE**\nTracking {len(bot.security_id_map)} F&O stocks.", parse_mode='Markdown')
+    while True:
+        logger.info("============== NEW SCAN CYCLE ==============")
+        for symbol in bot.security_id_map.keys():
+            await bot.process_stock(symbol)
+            logger.info("--- Waiting 3 seconds before next stock ---")
+            await asyncio.sleep(3)
+        
+        logger.info("Scan cycle complete. Waiting for 10 minutes...")
+        await asyncio.sleep(600)
 
 if __name__ == '__main__':
     try:
