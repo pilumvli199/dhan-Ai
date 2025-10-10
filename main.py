@@ -712,21 +712,32 @@ class TradingBot:
             
             # 9. Send AI Analysis (if available)
             if ai_analysis:
-                # Split karnar jar message lamba asel
-                if len(ai_analysis) > 4000:
-                    parts = [ai_analysis[i:i+4000] for i in range(0, len(ai_analysis), 4000)]
-                    for part in parts:
+                # Markdown special characters escape करतो
+                def escape_markdown(text):
+                    """Telegram Markdown V2 साठी escape करतो"""
+                    # Basic escape - फक्त problematic characters
+                    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+                    for char in escape_chars:
+                        text = text.replace(char, f'\\{char}')
+                    return text
+                
+                # Plain text मध्ये पाठवतो (No markdown parsing)
+                header = f"🤖 AI TRADE ANALYSIS - {symbol}\n{'='*40}\n\n"
+                full_message = header + ai_analysis
+                
+                # Split करतो jar खूप मोठा message असेल
+                if len(full_message) > 4000:
+                    parts = [full_message[i:i+4000] for i in range(0, len(full_message), 4000)]
+                    for idx, part in enumerate(parts, 1):
                         await self.bot.send_message(
                             chat_id=TELEGRAM_CHAT_ID,
-                            text=f"🤖 *AI ANALYSIS - {symbol}*\n\n{part}",
-                            parse_mode='Markdown'
+                            text=f"[Part {idx}/{len(parts)}]\n{part}"
                         )
                         await asyncio.sleep(1)
                 else:
                     await self.bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=f"🤖 *AI TRADE ANALYSIS - {symbol}*\n{'='*40}\n\n{ai_analysis}",
-                        parse_mode='Markdown'
+                        text=full_message
                     )
             else:
                 logger.warning(f"⚠️ AI analysis unavailable for {symbol}")
