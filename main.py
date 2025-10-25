@@ -152,7 +152,7 @@ class HighProbabilityCheck:
     time_check: bool
     score_check: bool
     rejection_reason: str = ""
-   class RedisCache:
+class RedisCache:
        def __init__(self):  # ✅ 4 spaces indent
         try:
             logger.info("🔴 Connecting to Redis...")
